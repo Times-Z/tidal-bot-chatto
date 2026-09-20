@@ -1,10 +1,20 @@
 version: '3'
 
+vars:
+  TASK_BIN:
+    sh: command -v go-task >/dev/null 2>&1 && echo "go-task" || echo "task"
+
 tasks:
   default:
     desc: Show available tasks
     cmds:
-      - go-task --list
+      - "{{.TASK_BIN}} --list"
+
+  ci:
+    desc: Run continuous integration tasks
+    cmds:
+      - "{{.TASK_BIN}} fmt"
+      - "{{.TASK_BIN}} test"
 
   build:
     desc: Build chatto-bot-tidal binary (release)
