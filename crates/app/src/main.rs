@@ -52,6 +52,8 @@ async fn run() -> Result<()> {
         tidal_client.clone(),
     );
 
+    info!(version = bot::version(), "chatto-bot-tidal starting");
+
     info!(
         rooms = ?cfg.rooms,
         poll_interval = ?cfg.poll_interval,

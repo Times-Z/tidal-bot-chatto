@@ -13,18 +13,7 @@ Supports **multiple rooms and voice channels simultaneously** — each room gets
 
 ## Architecture
 
-```
-User ──(play Daft Punk)──▶ Chatto ──▶ Bot (polling GetRoomEvents)
-                                            │
-                                            ├──▶ Tidal API (search + FLAC audio stream)
-                                            │
-                                            ├──▶ Chatto VoiceCallService
-                                            │     (JoinCall → CreateCallToken)
-                                            │
-                                            └──▶ LiveKit (publish PCM16 audio)
-                                                   │
-                                                   └──▶ Participants hear the music
-```
+![Chatto Tidal Bot architecture](.github/assets/architecture.png)
 
 ## Prerequisites
 
@@ -193,6 +182,7 @@ The bot joins the configured rooms and listens for chat commands. Defaults to `c
 | `/chatto-tidal stop` | Stop playback and clear the queue |
 | `/chatto-tidal nowplaying` | Show the currently playing track |
 | `/chatto-tidal volume <0-200>` | Show or set the global volume |
+| `/chatto-tidal version` | Show the running bot version |
 | `/chatto-tidal help` | Display available commands |
 
 The bot only reacts when it is addressed: either with the namespaced

@@ -373,6 +373,10 @@ impl Bot {
             Command::Lyrics => {
                 self.cmd_lyrics(room_id).await;
             }
+            Command::Version => {
+                self.send_message(room_id, &card("Version", crate::version()))
+                    .await;
+            }
         }
 
         Ok(())
@@ -1192,6 +1196,6 @@ fn format_duration(seconds: i32) -> String {
 fn help_message() -> String {
     card(
         "Commands",
-        "Use /chatto-tidal <command> or mention me\nplay <track>\nqueue <track>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nhelp",
+        "Use /chatto-tidal <command> or mention me\nplay <track>\nqueue <track>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nversion\nhelp",
     )
 }

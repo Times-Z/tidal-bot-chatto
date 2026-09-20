@@ -10,6 +10,7 @@ pub enum Command {
     Test,
     Help,
     Lyrics,
+    Version,
 }
 
 /// Namespaced slash command handled by this bot. Plain `/play` style messages
@@ -72,6 +73,7 @@ pub fn parse_command(body: &str, bot_name: &str) -> Option<ParsedCommand> {
         "test" => Command::Test,
         "help" => Command::Help,
         "lyrics" => Command::Lyrics,
+        "version" => Command::Version,
         _ => return None,
     };
 
@@ -163,6 +165,13 @@ mod tests {
     #[test]
     fn parse_only_mention() {
         assert!(parse_command("@tidal_bot", "tidal_bot").is_none());
+    }
+
+    #[test]
+    fn parse_version_command() {
+        let cmd = parse_command("/chatto-tidal version", "tidal_bot").unwrap();
+        assert_eq!(cmd.command, Command::Version);
+        assert_eq!(cmd.args, "");
     }
 
     #[test]
