@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "bot"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "ab_glyph",
  "arc-swap",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "chatto"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "mockito",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "chatto-bot-tidal"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "bot",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "humantime",
  "serde",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "livekit_audio"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "libwebrtc",
  "livekit",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "livekit_video"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "libwebrtc",
  "livekit",
@@ -3270,7 +3270,7 @@ dependencies = [
 
 [[package]]
 name = "tidal"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
