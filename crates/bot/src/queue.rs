@@ -163,4 +163,91 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].tid, 2);
     }
+
+    #[test]
+    fn queue_starts_empty() {
+        let q = Queue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.total_len(), 0);
+        assert!(q.list().is_empty());
+        assert!(q.current().is_none());
+    }
+
+    #[test]
+    fn queue_default_matches_new() {
+        let a = Queue::default();
+        let b = Queue::new();
+        assert_eq!(a.total_len(), b.total_len());
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn total_len_keeps_history_len_counts_pending() {
+        let mut q = Queue::new();
+        q.add(track(1, "A", 100));
+        q.add(track(2, "B", 200));
+        q.add(track(3, "C", 300));
+
+        q.dequeue(); // plays A, B and C remain pending
+        assert_eq!(q.total_len(), 3);
+        assert_eq!(q.len(), 2);
+        assert!(!q.is_empty());
+
+        q.skip(); // drop B
+        assert_eq!(q.total_len(), 3);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.current().unwrap().tid, 2); // B still reported as last position
+    }
+
+    #[test]
+    fn queue_drains_to_empty() {
+        let mut q = Queue::new();
+        q.add(track(1, "A", 100));
+        q.dequeue();
+
+        assert!(q.is_empty());
+        assert!(q.list().is_empty());
+        assert!(q.dequeue().is_none());
+        assert!(!q.skip());
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.total_len(), 1); // history is still visible
+    }
+
+    #[test]
+    fn skip_on_empty_queue_is_noop() {
+        let mut q = Queue::new();
+        assert!(!q.skip());
+        assert!(!q.skip());
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn clear_resets_history_and_position() {
+        let mut q = Queue::new();
+        q.add(track(1, "A", 100));
+        q.dequeue();
+        q.add(track(2, "B", 200));
+        q.clear();
+
+        assert!(q.is_empty());
+        assert_eq!(q.total_len(), 0);
+        assert!(q.current().is_none());
+        assert!(q.list().is_empty());
+
+        // The queue is usable again after a clear.
+        q.add(track(3, "C", 300));
+        assert_eq!(q.dequeue().unwrap().tid, 3);
+    }
+
+    #[test]
+    fn add_preserves_insertion_order() {
+        let mut q = Queue::new();
+        for i in 0..5 {
+            q.add(track(i, "t", 1));
+        }
+        let list = q.list();
+        let tids: Vec<u64> = list.iter().map(|t| t.tid).collect();
+        assert_eq!(tids, vec![0, 1, 2, 3, 4]);
+    }
 }

@@ -275,4 +275,52 @@ mod tests {
         let pcm = bytes_to_pcm16(&bytes);
         assert_eq!(pcm, vec![10_000, -32_768]);
     }
+
+    #[test]
+    fn bytes_to_pcm16_empty_and_odd_len() {
+        assert!(bytes_to_pcm16(&[]).is_empty());
+        // A trailing odd byte is not a complete sample and gets dropped.
+        assert_eq!(bytes_to_pcm16(&[0x01]), Vec::<i16>::new());
+        assert_eq!(bytes_to_pcm16(&[0x01, 0x00, 0x99]), vec![1]);
+    }
+
+    #[test]
+    fn apply_volume_scales_and_clamps() {
+        assert_eq!(apply_volume(1000, 0.5), 500);
+        assert_eq!(apply_volume(-20_000, 0.5), -10_000);
+        assert_eq!(apply_volume(i16::MAX, 1.0), i16::MAX);
+        assert_eq!(apply_volume(i16::MIN, 1.0), i16::MIN);
+        // Boosting past the range clamps instead of wrapping.
+        assert_eq!(apply_volume(i16::MAX, 2.0), i16::MAX);
+        assert_eq!(apply_volume(i16::MIN, 2.0), i16::MIN);
+        assert_eq!(apply_volume(123, 0.0), 0);
+    }
+
+    #[test]
+    fn error_display_strings() {
+        assert_eq!(
+            Error::InvalidSampleRate(96_000).to_string(),
+            "invalid sample rate 96000, expected 44100 or 48000"
+        );
+        assert_eq!(Error::Cancelled.to_string(), "playback cancelled");
+        assert_eq!(
+            Error::FfmpegFailed("boom".to_owned()).to_string(),
+            "ffmpeg failed: boom"
+        );
+    }
+
+    #[test]
+    fn config_is_clonable() {
+        let cfg = Config {
+            url: "wss://lk.example.com".to_owned(),
+            token: "jwt".to_owned(),
+            room: "call_1".to_owned(),
+            sample_rate: 48_000,
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.url, cfg.url);
+        assert_eq!(cloned.token, cfg.token);
+        assert_eq!(cloned.room, cfg.room);
+        assert_eq!(cloned.sample_rate, cfg.sample_rate);
+    }
 }

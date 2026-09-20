@@ -694,4 +694,227 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn parse_lrc_timestamp_formats() {
+        // No fractional part.
+        let lines = parse_lrc("[00:01] hi");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].timestamp_ms, 1000);
+
+        // Colon used as fractional separator (centiseconds).
+        let lines = parse_lrc("[00:01:50] hi");
+        assert_eq!(lines[0].timestamp_ms, 1500);
+
+        // Half second written with a single digit.
+        let lines = parse_lrc("[00:01.5] hi");
+        assert_eq!(lines[0].timestamp_ms, 1500);
+
+        // Three-digit milliseconds pass through.
+        let lines = parse_lrc("[00:01.123] hi");
+        assert_eq!(lines[0].timestamp_ms, 1123);
+
+        // Large minute values.
+        let lines = parse_lrc("[60:00] epic");
+        assert_eq!(lines[0].timestamp_ms, 3_600_000);
+    }
+
+    #[test]
+    fn parse_lrc_skips_unusable_lines() {
+        let input = "
+            \n                        # comment-ish
+            [00:00]
+            [no timestamp colon] text
+            [aa:bb] bad numbers
+            [01:bb] bad seconds
+            [00:05]  kept  ";
+        let lines = parse_lrc(input);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert_eq!(lines[0].text, "kept");
+    }
+
+    #[test]
+    fn parse_lrc_sorts_by_timestamp() {
+        let lines = parse_lrc("[00:03] c\n[00:01] a\n[00:02] b");
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_lrc_multi_timestamp_line_keeps_first_tag() {
+        // Documented behavior: only the first [mm:ss] tag of a line is used
+        // as the timestamp; any later tags stay in the text.
+        let lines = parse_lrc("[00:01][00:02] word");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].timestamp_ms, 1000);
+        assert_eq!(lines[0].text, "[00:02] word");
+    }
+
+    #[test]
+    fn lyric_line_parse_lrc_delegates_to_parser() {
+        let via_type = LyricLine::parse_lrc("[00:02] hey");
+        assert_eq!(via_type.len(), 1);
+        assert_eq!(via_type[0].timestamp_ms, 2000);
+        assert_eq!(via_type[0].text, "hey");
+    }
+
+    #[test]
+    fn parse_tidal_url_extra_cases() {
+        // Query strings are ignored.
+        let (kind, id) = parse_tidal_url("https://www.tidal.com/track/9?si=abc").unwrap();
+        assert_eq!((kind, id), (TidalContentType::Track, "9".to_owned()));
+
+        // Host matching is case-insensitive (Url::parse lowercases it).
+        let (kind, id) = parse_tidal_url("https://TIDAL.COM/artist/2").unwrap();
+        assert_eq!((kind, id), (TidalContentType::Artist, "2".to_owned()));
+
+        // Trailing junk after the id is ignored.
+        let (kind, id) = parse_tidal_url("https://tidal.com/browse/album/7/extra").unwrap();
+        assert_eq!((kind, id), (TidalContentType::Album, "7".to_owned()));
+
+        // Known error branches.
+        assert!(matches!(
+            parse_tidal_url("https://tidal.com/mix/1"),
+            Err(Error::UnsupportedContentType(mix)) if mix == "mix"
+        ));
+        assert!(matches!(
+            parse_tidal_url("https://tidal.com/browse"),
+            Err(Error::UnrecognizedUrlPath(_))
+        ));
+        assert!(matches!(
+            parse_tidal_url("https://tidal.com"),
+            Err(Error::UnrecognizedUrlPath(_))
+        ));
+        assert!(matches!(
+            parse_tidal_url("https://example.com"),
+            Err(Error::NotTidalUrl)
+        ));
+        assert!(parse_tidal_url("not a url at all:(((").is_err());
+    }
+
+    #[test]
+    fn content_type_display_names() {
+        assert_eq!(TidalContentType::Track.to_string(), "track");
+        assert_eq!(TidalContentType::Album.to_string(), "album");
+        assert_eq!(TidalContentType::Playlist.to_string(), "playlist");
+        assert_eq!(TidalContentType::Artist.to_string(), "artist");
+    }
+
+    #[test]
+    fn parse_quality_edges() {
+        assert_eq!(parse_quality(""), "");
+        assert_eq!(parse_quality("   "), "");
+        assert_eq!(parse_quality("Hi_Res_Lossless"), QUALITY_HI_RES_LOSSLESS);
+        assert_eq!(parse_quality("lossless"), QUALITY_LOSSLESS);
+    }
+
+    #[test]
+    fn cover_url_without_dashes_is_passthrough() {
+        assert_eq!(
+            cover_url("abc123"),
+            "https://resources.tidal.com/images/abc123/320x320.jpg"
+        );
+    }
+
+    #[test]
+    fn default_credentials_are_decoded() {
+        let (client_id, client_secret) = default_credentials().unwrap();
+        assert!(!client_id.is_empty());
+        assert!(!client_secret.is_empty());
+        assert!(!client_id.contains(';'));
+    }
+
+    #[test]
+    fn load_saved_token_missing_file_is_none() {
+        let path = std::env::temp_dir().join("definitely-missing-token-file.json");
+        let _ = std::fs::remove_file(&path);
+        assert!(load_saved_token(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_saved_token_rejects_bad_json_and_empty_fields() {
+        let dir = std::env::temp_dir().join(format!("tidal-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Malformed JSON surfaces as a dedicated error.
+        let path = dir.join("bad.json");
+        std::fs::write(&path, "{ nope").unwrap();
+        assert!(matches!(load_saved_token(&path), Err(Error::TokenParse(_))));
+
+        // An empty access_token is treated like a missing one.
+        std::fs::write(&path, r#"{"access_token":"","refresh_token":"r"}"#).unwrap();
+        assert!(load_saved_token(&path).unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_saved_token_reads_full_authz_shape() {
+        let dir = std::env::temp_dir().join(format!("tidal-full-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        std::fs::write(
+            &path,
+            r#"{"access_token":"a","refresh_token":"r","user_id":7,"country_code":"BE"}"#,
+        )
+        .unwrap();
+
+        let authz = load_saved_token(&path).unwrap().unwrap();
+        assert_eq!(authz.user_id, 7);
+        assert_eq!(authz.country_code.as_deref(), Some("BE"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn format_audio_info_more_codecs() {
+        let base = |codec: &str, quality: &str, bd: i32, sr: i32| TrackStream {
+            stream_url: String::new(),
+            quality: quality.to_owned(),
+            codec: codec.to_owned(),
+            bit_depth: bd,
+            sample_rate: sr,
+        };
+
+        assert_eq!(
+            base("mp4a.40.5", "HIGH", 16, 44100).format_audio_info(),
+            "HE-AAC 16bit 44kHz"
+        );
+        assert_eq!(base("mha1", "HIGH", 0, 0).format_audio_info(), "MPEG-H");
+        assert_eq!(
+            base("mp4a.40.34", "LOW", 0, 0).format_audio_info(),
+            "AAC-LD"
+        );
+        // Unknown codec with metadata falls back to the quality label.
+        assert_eq!(
+            base("xyz", "LOSSLESS", 16, 44100).format_audio_info(),
+            "LOSSLESS 16bit 44kHz"
+        );
+        // No codec, no metadata: plain quality label.
+        assert_eq!(base("", "HIGH", 0, 0).format_audio_info(), "HIGH");
+        // No codec but with metadata: the leading space is current behavior.
+        assert_eq!(
+            base("", "HI_RES_LOSSLESS", 24, 96000).format_audio_info(),
+            " 24bit 96kHz"
+        );
+    }
+
+    #[test]
+    fn error_displays_are_actionable() {
+        assert_eq!(Error::NotAuthenticated.to_string(), "not authenticated");
+        assert_eq!(
+            Error::MissingStreamUrl.to_string(),
+            "missing stream url in playback response"
+        );
+        assert!(
+            Error::UnsupportedContentType("mix".to_owned())
+                .to_string()
+                .contains("mix")
+        );
+        assert!(
+            Error::UnrecognizedUrlPath("/browse".to_owned())
+                .to_string()
+                .contains("/browse")
+        );
+    }
 }

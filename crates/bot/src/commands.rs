@@ -233,4 +233,109 @@ mod tests {
         assert!(parse_command("/chatto-tidal", "tidal_bot").is_none());
         assert!(parse_command("/chatto-tidal dance", "tidal_bot").is_none());
     }
+
+    #[test]
+    fn parse_all_command_variants() {
+        let cases = [
+            ("play x", Command::Play),
+            ("queue y", Command::Queue),
+            ("skip", Command::Skip),
+            ("stop", Command::Stop),
+            ("nowplaying", Command::NowPlaying),
+            ("volume 80", Command::Volume),
+            ("mute", Command::Mute),
+            ("unmute", Command::Mute),
+            ("test", Command::Test),
+            ("help", Command::Help),
+            ("lyrics", Command::Lyrics),
+            ("version", Command::Version),
+        ];
+        for (body, expected) in cases {
+            let cmd = parse_command(body, "tidal_bot")
+                .unwrap_or_else(|| panic!("failed to parse {body:?}"));
+            assert_eq!(cmd.command, expected, "for {body:?}");
+        }
+    }
+
+    #[test]
+    fn parse_collapse_whitespace_around_args() {
+        let cmd = parse_command("  /chatto-tidal   play   some  song  ", "tidal_bot").unwrap();
+        assert_eq!(cmd.command, Command::Play);
+        assert_eq!(cmd.args, "some  song");
+    }
+
+    #[test]
+    fn parse_slash_only_returns_none() {
+        assert!(parse_command("/", "tidal_bot").is_none());
+        assert!(parse_command(" / ", "tidal_bot").is_none());
+    }
+
+    #[test]
+    fn parse_with_empty_bot_name_ignores_mentions() {
+        assert!(parse_command("@tidal_bot play x", "").is_none());
+        assert_eq!(
+            parse_command("/chatto-tidal play x", "").unwrap().command,
+            Command::Play
+        );
+    }
+
+    #[test]
+    fn mention_stripping_is_case_insensitive() {
+        let cmd = parse_command("@TIDAL_BOT skip", "tidal_bot").unwrap();
+        assert_eq!(cmd.command, Command::Skip);
+        let cmd = parse_command("@Tidal_Bot /stop", "tidal_bot").unwrap();
+        assert_eq!(cmd.command, Command::Stop);
+    }
+
+    #[test]
+    fn mid_text_mention_is_not_parsed_as_command() {
+        // is_addressed accepts mentions anywhere, but parsing requires the
+        // mention to lead the message.
+        assert!(parse_command("hey @tidal_bot skip", "tidal_bot").is_none());
+    }
+
+    #[test]
+    fn prefix_without_boundary_is_not_ours() {
+        assert!(parse_command("/chatto-tidalxyz play", "tidal_bot").is_none());
+    }
+
+    #[test]
+    fn namespaced_prefix_is_case_insensitive() {
+        let cmd = parse_command("/CHATTO-TIDAL PLAY Daft Punk", "tidal_bot").unwrap();
+        assert_eq!(cmd.command, Command::Play);
+        // The args keep their original case.
+        assert_eq!(cmd.args, "Daft Punk");
+    }
+
+    #[test]
+    fn parse_args_keep_unicode() {
+        let cmd = parse_command("play ÆØÅ Café – 世界", "tidal_bot").unwrap();
+        assert_eq!(cmd.args, "ÆØÅ Café – 世界");
+    }
+
+    #[test]
+    fn addressed_with_slash_separator_after_prefix() {
+        assert!(is_addressed("/chatto-tidal/play x", &["tidal_bot"]));
+        assert_eq!(
+            parse_command("/chatto-tidal/play x", "tidal_bot")
+                .unwrap()
+                .command,
+            Command::Play
+        );
+    }
+
+    #[test]
+    fn addressed_by_display_name_mention() {
+        assert!(is_addressed("@Tidal Bot play something", &["Tidal Bot"]));
+        assert!(is_addressed("yo, ask @tidal_bot first", &["tidal_bot"]));
+    }
+
+    #[test]
+    fn is_addressed_ignores_bare_prefix_lookalikes() {
+        assert!(!is_addressed("/chatto-tidal-not-a-command", &[]));
+        assert!(!is_addressed(
+            "tidal_bot without the at sign",
+            &["tidal_bot"]
+        ));
+    }
 }

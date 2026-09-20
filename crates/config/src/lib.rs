@@ -274,4 +274,328 @@ mod tests {
     fn parse_duration_invalid() {
         assert!(parse_duration("not-a-duration").is_err());
     }
+
+    // Tests touching process environment variables must hold this lock so
+    // they never race with each other (edition 2024 makes env mutation
+    // unsafe precisely because of such races).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn tmp_config_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "chatto-config-{}-{tag}-{n}.json",
+            std::process::id()
+        ))
+    }
+
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn with_content(tag: &str, content: &str) -> Self {
+            let path = tmp_config_path(tag);
+            fs::write(&path, content).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    const MINIMAL: &str = r#"{
+        "chatto_url": "https://chat.example.com",
+        "chatto_token": "cht_BK_x",
+        "livekit_url": "wss://lk.example.com",
+        "rooms": ["r1"]
+    }"#;
+
+    #[test]
+    fn load_full_config_file() {
+        let file = TempFile::with_content(
+            "full",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "tidal_token_path": "custom_token.json",
+                "tidal_quality": "HIGH",
+                "sample_rate": 44100,
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1", "r2"],
+                "poll_interval": "5s",
+                "bot_name": "my_bot",
+                "volume": 55
+            }"#,
+        );
+        let cfg = AppConfig::load_from_path(&file.0).unwrap();
+        assert_eq!(cfg.chatto_url, "https://chat.example.com");
+        assert_eq!(cfg.tidal_token_path, "custom_token.json");
+        assert_eq!(cfg.tidal_quality, "HIGH");
+        assert_eq!(cfg.sample_rate, 44_100);
+        assert_eq!(cfg.rooms, vec!["r1".to_owned(), "r2".to_owned()]);
+        assert_eq!(cfg.poll_interval, Duration::from_secs(5));
+        assert_eq!(cfg.bot_name, "my_bot");
+        assert_eq!(cfg.volume, 55);
+    }
+
+    #[test]
+    fn load_applies_defaults() {
+        let file = TempFile::with_content("defaults", MINIMAL);
+        let cfg = AppConfig::load_from_path(&file.0).unwrap();
+        assert_eq!(cfg.poll_interval, DEFAULT_POLL_INTERVAL);
+        assert_eq!(cfg.sample_rate, DEFAULT_SAMPLE_RATE);
+        assert_eq!(cfg.volume, DEFAULT_VOLUME);
+        assert_eq!(cfg.tidal_token_path, DEFAULT_TIDAL_TOKEN_PATH);
+        assert_eq!(cfg.bot_name, "");
+    }
+
+    #[test]
+    fn empty_tidal_token_path_falls_back_to_default() {
+        let file = TempFile::with_content(
+            "tokenpath",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "tidal_token_path": "   ",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"]
+            }"#,
+        );
+        let cfg = AppConfig::load_from_path(&file.0).unwrap();
+        assert_eq!(cfg.tidal_token_path, "tidal_token.json");
+    }
+
+    #[test]
+    fn load_missing_file_is_read_error() {
+        let path = tmp_config_path("missing");
+        let err = AppConfig::load_from_path(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Read(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn load_invalid_json_is_parse_error() {
+        let file = TempFile::with_content("bad-json", "{ not json");
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn load_rejects_bad_poll_interval() {
+        let file = TempFile::with_content(
+            "bad-poll",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"],
+                "poll_interval": "not-a-duration"
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("poll_interval"));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_volume() {
+        // 300 fits in u16 but not u8: caught as a validation error.
+        let file = TempFile::with_content(
+            "vol-300",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"],
+                "volume": 300
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+
+        // 250 fits in u8 but violates the 0..=200 rule in validate().
+        let file = TempFile::with_content(
+            "vol-250",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"],
+                "volume": 250
+            }"#,
+        );
+        assert!(AppConfig::load_from_path(&file.0).is_err());
+
+        // 65536 does not even fit in u16: serde parse error.
+        let file = TempFile::with_content(
+            "vol-65k",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"],
+                "volume": 65536
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn load_rejects_bad_sample_rate() {
+        let file = TempFile::with_content(
+            "bad-rate",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"],
+                "sample_rate": 96000
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn load_rejects_bad_urls_and_rooms() {
+        // Wrong scheme for the Chatto URL.
+        let file = TempFile::with_content(
+            "ftp",
+            r#"{
+                "chatto_url": "ftp://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"]
+            }"#,
+        );
+        assert!(AppConfig::load_from_path(&file.0).is_err());
+
+        // URL without host: rejected by the URL parser itself.
+        let file = TempFile::with_content(
+            "nohost",
+            r#"{
+                "chatto_url": "https://",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"]
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(err.to_string().contains("empty host"), "got {err}");
+
+        // Parses fine but has no host component: scheme-and-host error.
+        let file = TempFile::with_content(
+            "nohost2",
+            r#"{
+                "chatto_url": "mailto:someone@example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": ["r1"]
+            }"#,
+        );
+        let err = AppConfig::load_from_path(&file.0).unwrap_err();
+        assert!(err.to_string().contains("scheme and host"), "got {err}");
+
+        // Empty rooms list.
+        let file = TempFile::with_content(
+            "norooms",
+            r#"{
+                "chatto_url": "https://chat.example.com",
+                "chatto_token": "cht_BK_x",
+                "livekit_url": "wss://lk.example.com",
+                "rooms": []
+            }"#,
+        );
+        assert!(AppConfig::load_from_path(&file.0).is_err());
+    }
+
+    #[test]
+    fn env_fills_missing_url_and_token() {
+        let _guard = env_lock();
+        let old_url = env::var("CHATTO_URL").ok();
+        let old_token = env::var("CHATTO_TOKEN").ok();
+
+        unsafe {
+            env::set_var("CHATTO_URL", "https://env.example.com");
+            env::set_var("CHATTO_TOKEN", "cht_BK_env");
+        }
+        let result = (|| {
+            let file = TempFile::with_content(
+                "env-fallback",
+                r#"{ "livekit_url": "wss://lk.example.com", "rooms": ["r1"] }"#,
+            );
+            AppConfig::load_from_path(&file.0)
+        })();
+
+        // Restore the ambient environment for the other tests.
+        unsafe {
+            match old_url {
+                Some(v) => env::set_var("CHATTO_URL", v),
+                None => env::remove_var("CHATTO_URL"),
+            }
+            match old_token {
+                Some(v) => env::set_var("CHATTO_TOKEN", v),
+                None => env::remove_var("CHATTO_TOKEN"),
+            }
+        }
+
+        let cfg = result.unwrap();
+        assert_eq!(cfg.chatto_url, "https://env.example.com");
+        assert_eq!(cfg.chatto_token, "cht_BK_env");
+    }
+
+    #[test]
+    fn explicit_file_values_win_over_env() {
+        let _guard = env_lock();
+        let old_url = env::var("CHATTO_URL").ok();
+        unsafe {
+            env::set_var("CHATTO_URL", "https://should-not-be-used.example.com");
+        }
+        let result = (|| {
+            let file = TempFile::with_content("env-precedence", MINIMAL);
+            AppConfig::load_from_path(&file.0)
+        })();
+        unsafe {
+            match old_url {
+                Some(v) => env::set_var("CHATTO_URL", v),
+                None => env::remove_var("CHATTO_URL"),
+            }
+        }
+        let cfg = result.unwrap();
+        assert_eq!(cfg.chatto_url, "https://chat.example.com");
+    }
+
+    #[test]
+    fn missing_chatto_url_without_env_is_validation_error() {
+        let _guard = env_lock();
+        let old = env::var("CHATTO_URL").ok();
+        unsafe {
+            env::remove_var("CHATTO_URL");
+        }
+        let result = (|| {
+            let file = TempFile::with_content(
+                "missing-url",
+                r#"{ "chatto_token": "cht_BK_x", "livekit_url": "wss://lk.example.com", "rooms": ["r1"] }"#,
+            );
+            AppConfig::load_from_path(&file.0)
+        })();
+        unsafe {
+            if let Some(v) = old {
+                env::set_var("CHATTO_URL", v);
+            }
+        }
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("chatto_url is required"),
+            "got {err}"
+        );
+    }
 }

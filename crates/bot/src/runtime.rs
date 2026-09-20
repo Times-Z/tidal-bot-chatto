@@ -1199,3 +1199,145 @@ fn help_message() -> String {
         "Use /chatto-tidal <command> or mention me\nplay <track>\nqueue <track>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nversion\nhelp",
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_basic() {
+        assert_eq!(format_duration(0), "0:00");
+        assert_eq!(format_duration(5), "0:05");
+        assert_eq!(format_duration(59), "0:59");
+        assert_eq!(format_duration(60), "1:00");
+        assert_eq!(format_duration(65), "1:05");
+        assert_eq!(format_duration(3661), "61:01");
+    }
+
+    #[test]
+    fn card_frames_title_and_body() {
+        let out = card("T", "line1\nline2");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "header + 2 body + footer, got {out:?}");
+
+        assert!(lines[0].starts_with("┌─ T "), "header: {:?}", lines[0]);
+        assert!(lines[0].ends_with('┐'));
+        assert_eq!(lines[0].chars().count(), 52);
+
+        assert!(lines[1].starts_with("│  line1"));
+        assert!(lines[2].starts_with("│  line2"));
+
+        assert!(lines[3].starts_with("└─"));
+        assert!(lines[3].ends_with('┘'));
+        assert_eq!(lines[3].chars().count(), 52);
+        assert!(out.ends_with('┘'), "no trailing newline expected");
+    }
+
+    #[test]
+    fn card_with_empty_body_only_borders() {
+        let out = card("Empty", "");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("┌─ Empty "));
+        assert!(lines[1].starts_with('└'));
+    }
+
+    #[test]
+    fn card_with_empty_title() {
+        let out = card("", "x");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0].chars().count(), 52);
+        assert!(lines[0].starts_with("┌─  "));
+    }
+
+    #[test]
+    fn card_with_long_title_overflows_without_panicking() {
+        let long_title = "a very very very very very very long title indeed"; // 49 chars
+        let out = card(long_title, "body");
+        let header = out.lines().next().unwrap();
+        assert!(header.contains(long_title));
+        assert!(header.ends_with('┐'));
+        // No room for filler dashes: header is just the title plus 5 borders.
+        assert_eq!(header.chars().count(), long_title.chars().count() + 5);
+    }
+
+    #[test]
+    fn parse_event_time_accepts_rfc3339() {
+        let got = parse_event_time("2026-01-02T03:04:05Z").unwrap();
+        let want = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_event_time_converts_offsets_to_utc() {
+        let got = parse_event_time("2026-01-02T05:04:05+02:00").unwrap();
+        let want = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_event_time_assumes_naive_is_utc() {
+        let got = parse_event_time("2026-01-02T03:04:05").unwrap();
+        let want = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(got, want);
+
+        // Fractional seconds are accepted by the fallback parser.
+        let got = parse_event_time("2026-01-02T03:04:05.500").unwrap();
+        let want = DateTime::parse_from_rfc3339("2026-01-02T03:04:05.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_event_time_rejects_garbage() {
+        assert!(parse_event_time("").is_none());
+        assert!(parse_event_time("garbage").is_none());
+        assert!(parse_event_time("2026-01-02").is_none());
+    }
+
+    #[test]
+    fn gradient_background_is_row_uniform_and_opaque() {
+        let img = create_gradient_background(8, 4);
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 4);
+
+        // Top row starts from the fixed base color.
+        assert_eq!(*img.get_pixel(0, 0), image::Rgba([26, 26, 46, 255]));
+        // Bottom row interpolates toward the end color.
+        assert_eq!(*img.get_pixel(7, 3), image::Rgba([23, 31, 58, 255]));
+
+        // Rows are uniform horizontally and fully opaque.
+        for y in 0..4 {
+            let first = *img.get_pixel(0, y);
+            for x in 0..8 {
+                assert_eq!(*img.get_pixel(x, y), first);
+                assert_eq!(first[3], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn help_message_lists_commands_in_a_card() {
+        let msg = help_message();
+        assert!(msg.starts_with("┌─ Commands "), "got: {msg}");
+        for needle in [
+            "play <track>",
+            "queue <track>",
+            "nowplaying",
+            "volume <0-200>",
+            "mute / unmute",
+            "lyrics",
+            "version",
+            "help",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in help");
+        }
+    }
+}

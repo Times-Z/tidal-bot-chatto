@@ -677,4 +677,305 @@ mod tests {
         create_msg.assert_async().await;
         presence.assert_async().await;
     }
+
+    fn varint(value: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, value);
+        buf
+    }
+
+    #[test]
+    fn test_encode_varint_values() {
+        assert_eq!(varint(0), [0x00]);
+        assert_eq!(varint(1), [0x01]);
+        assert_eq!(varint(127), [0x7F]);
+        assert_eq!(varint(128), [0x80, 0x01]);
+        assert_eq!(varint(300), [0xAC, 0x02]);
+        assert_eq!(varint(16_384), [0x80, 0x80, 0x01]);
+        let mut max = vec![0xFFu8; 9];
+        max.push(0x01);
+        assert_eq!(varint(u64::MAX), max);
+    }
+
+    #[test]
+    fn test_encode_varint_appends() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 2);
+        encode_varint(&mut buf, 128);
+        assert_eq!(buf, vec![0x02, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn test_truncate_more_edges() {
+        // Exact fit returns the whole string untouched.
+        assert_eq!(truncate("hello", 5), "hello");
+        // Cutting in the middle of a multibyte char backs off to the boundary.
+        assert_eq!(truncate("aé", 2), "a");
+        assert_eq!(truncate("é", 1), "");
+        // max_len larger than the string.
+        assert_eq!(truncate("hi", 100), "hi");
+    }
+
+    #[test]
+    fn test_error_helpers_variants() {
+        // not_found status codes also mean "not a member".
+        let err = Error::Rpc(RpcError {
+            status_code: StatusCode::NOT_FOUND,
+            url: "/x".to_owned(),
+            body: "rpc error: code not_found".to_owned(),
+        });
+        assert!(is_not_member_error(&err));
+        assert!(!is_permission_denied_error(&err));
+
+        // permission_denied code form.
+        let err = Error::Rpc(RpcError {
+            status_code: StatusCode::FORBIDDEN,
+            url: "/x".to_owned(),
+            body: "code: permission_denied".to_owned(),
+        });
+        assert!(is_permission_denied_error(&err));
+
+        // Case-insensitive matching of the human message.
+        let err = Error::Rpc(RpcError {
+            status_code: StatusCode::FORBIDDEN,
+            url: "/x".to_owned(),
+            body: "Not A Member Of This Room".to_owned(),
+        });
+        assert!(is_not_member_error(&err));
+    }
+
+    #[test]
+    fn test_helpers_false_on_non_rpc_errors() {
+        // Unmarshal is not an Rpc variant: the helpers must say no.
+        let err = Error::Unmarshal {
+            status_code: StatusCode::OK,
+            url: "/x".to_owned(),
+            source: serde_json::from_str::<u32>("not a number").unwrap_err(),
+            body: "not a number".to_owned(),
+        };
+        assert!(!is_not_member_error(&err));
+        assert!(!is_permission_denied_error(&err));
+    }
+
+    #[test]
+    fn test_rpc_error_display_includes_context() {
+        let err = Error::Rpc(RpcError {
+            status_code: StatusCode::FORBIDDEN,
+            url: "https://chat.example.com/api/connect/X/Y".to_owned(),
+            body: "boom".to_owned(),
+        });
+        let text = err.to_string();
+        assert!(text.contains("403"), "got {text}");
+        assert!(text.contains("https://chat.example.com"), "got {text}");
+        assert!(text.contains("boom"), "got {text}");
+    }
+
+    #[test]
+    fn test_room_event_serde_defaults() {
+        // Bare events from the poll API must deserialize with everything
+        // else defaulted.
+        let event: RoomTimelineEvent = serde_json::from_str(r#"{"id":"e1"}"#).unwrap();
+        assert_eq!(event.id, "e1");
+        assert_eq!(event.actor_id, "");
+        assert!(event.message_posted.is_none());
+        assert!(event.room_created.is_none());
+        assert!(event.user_joined_room.is_none());
+
+        // camelCase messagePosted payload.
+        let event: RoomTimelineEvent = serde_json::from_str(
+            r#"{"id":"e2","messagePosted":{"message":{"id":"m1","roomId":"r1","actorId":"a1","body":"hi"}}}"#,
+        )
+        .unwrap();
+        let posted = event.message_posted.unwrap();
+        assert_eq!(posted.message.body.as_deref(), Some("hi"));
+        assert_eq!(posted.message.room_id, "r1");
+
+        // A null body deserializes to None.
+        let event: RoomTimelineEvent =
+            serde_json::from_str(r#"{"messagePosted":{"message":{"body":null}}}"#).unwrap();
+        assert!(event.message_posted.unwrap().message.body.is_none());
+    }
+
+    #[test]
+    fn test_page_and_profile_serde() {
+        let page: RoomTimelinePage = serde_json::from_str(
+            r#"{"startCursor":"s","endCursor":"e","hasNewer":true,"includes":{"users":{"u1":{"id":"u1","login":"tidal_bot"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(page.start_cursor, "s");
+        assert!(page.has_newer);
+        assert!(!page.has_older);
+        assert!(page.events.is_empty());
+        let users = &page.includes.as_ref().unwrap().users;
+        assert_eq!(users["u1"].login.as_deref(), Some("tidal_bot"));
+        assert_eq!(users["u1"].display_name, None);
+
+        // A totally empty page still parses (all fields defaulted).
+        let page: RoomTimelinePage = serde_json::from_str("{}").unwrap();
+        assert_eq!(page.end_cursor, "");
+    }
+
+    #[tokio::test]
+    async fn test_join_and_leave_call_report_false() {
+        let mut server = Server::new_async().await;
+        let _join = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.VoiceCallService/JoinCall",
+            )
+            .with_status(200)
+            .with_body(r#"{"joined":false}"#)
+            .create_async()
+            .await;
+        let _leave = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.VoiceCallService/LeaveCall",
+            )
+            .with_status(200)
+            .with_body(r#"{"left":false}"#)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        assert!(!c.join_call("room1").await.unwrap());
+        assert!(!c.leave_call("room1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_call_token_missing_field_is_unmarshal_error() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.VoiceCallService/CreateCallToken",
+            )
+            .with_status(200)
+            // Missing e2eeKey and callId, which are required.
+            .with_body(r#"{"token":"only-token"}"#)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        let err = c.create_call_token("room1").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Unmarshal { .. }),
+            "expected unmarshal, got {err:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_profile_reads_camel_case_fields() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/connect/chatto.api.v1.ViewerService/GetViewer")
+            .expect(2)
+            .with_status(200)
+            .with_body(
+                r#"{"user":{"profile":{"id":"usr_9","login":"tidal_bot","displayName":"Tidal Bot","avatarUrl":"/a/b.png"}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        let profile = c.get_profile().await.unwrap();
+        assert_eq!(profile.id, "usr_9");
+        assert_eq!(profile.login.as_deref(), Some("tidal_bot"));
+        assert_eq!(profile.display_name.as_deref(), Some("Tidal Bot"));
+        assert_eq!(profile.avatar_url.as_deref(), Some("/a/b.png"));
+
+        // get_viewer is a shorthand for profile.id.
+        assert_eq!(c.get_viewer().await.unwrap(), "usr_9");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_membership_rpc_requests() {
+        let mut server = Server::new_async().await;
+        let add = server
+            .mock("POST", "/api/connect/chatto.api.v1.RoomService/AddMember")
+            .match_body(Matcher::JsonString(
+                r#"{"roomId":"r1","userId":"usr_2"}"#.to_owned(),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let join = server
+            .mock("POST", "/api/connect/chatto.api.v1.RoomService/JoinRoom")
+            .match_body(Matcher::JsonString(r#"{"roomId":"r1"}"#.to_owned()))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        c.add_member("r1", "usr_2").await.unwrap();
+        c.join_room("r1").await.unwrap();
+        add.assert_async().await;
+        join.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_empty_success_body_is_treated_as_null() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.MessageService/CreateMessage",
+            )
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        c.create_message("room1", "hello").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_avatar_empty_image_still_frames_request() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.UserService/UploadAvatar",
+            )
+            .match_header("connect-protocol-version", "1")
+            .match_body(Matcher::from(vec![
+                0x22, 0x02, // image field, 2 bytes of inner message
+                0x0A, 0x00, // ImageUpload.image = bytes of length 0
+                0x2A, 0x01, b'u', // user_id = "u"
+            ]))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        c.upload_avatar("u", b"").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_large_error_body_is_truncated() {
+        let mut server = Server::new_async().await;
+        let huge = "x".repeat(600);
+        let mock = server
+            .mock("POST", "/api/connect/chatto.api.v1.ViewerService/GetViewer")
+            .with_status(500)
+            .with_body(&huge)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        let err = c.get_viewer().await.unwrap_err();
+        match err {
+            Error::Rpc(rpc) => assert_eq!(rpc.body.len(), 500),
+            other => panic!("expected rpc error, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
 }

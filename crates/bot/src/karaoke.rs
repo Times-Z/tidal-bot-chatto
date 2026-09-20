@@ -444,3 +444,178 @@ pub fn rgba_to_i420(rgba: &RgbaImage) -> Vec<u8> {
     i420.extend_from_slice(&v_plane);
     i420
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(timestamp_ms: u64, text: &str) -> LyricLine {
+        LyricLine {
+            timestamp_ms,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn urlencoding_keeps_safe_chars_and_escapes_rest() {
+        assert_eq!(urlencoding("Daft Punk"), "Daft%20Punk");
+        assert_eq!(urlencoding("ok-1.2_3~4"), "ok-1.2_3~4");
+        assert_eq!(urlencoding("a+b?c"), "a%2Bb%3Fc");
+        assert_eq!(urlencoding(""), "");
+    }
+
+    #[test]
+    fn find_current_line_before_first_timestamp_returns_first() {
+        let lyrics = [line(1000, "a"), line(2000, "b")];
+        // Current index defaults to 0 so the first line shows while waiting.
+        assert_eq!(find_current_line(&lyrics, 0), 0);
+        assert_eq!(find_current_line(&lyrics, 999), 0);
+    }
+
+    #[test]
+    fn find_current_line_tracks_progress() {
+        let lyrics = [line(0, "a"), line(1000, "b"), line(2000, "c")];
+        assert_eq!(find_current_line(&lyrics, 500), 0);
+        assert_eq!(find_current_line(&lyrics, 1000), 1);
+        assert_eq!(find_current_line(&lyrics, 1999), 1);
+        assert_eq!(find_current_line(&lyrics, 2000), 2);
+    }
+
+    #[test]
+    fn find_current_line_stays_on_last_after_end() {
+        let lyrics = [line(0, "a"), line(1000, "b")];
+        assert_eq!(find_current_line(&lyrics, u64::MAX), 1);
+    }
+
+    #[test]
+    fn find_current_line_on_empty_is_zero() {
+        assert_eq!(find_current_line(&[], 1234), 0);
+    }
+
+    #[test]
+    fn format_duration_ms_cases() {
+        assert_eq!(format_duration_ms(0), "0:00");
+        assert_eq!(format_duration_ms(999), "0:00");
+        assert_eq!(format_duration_ms(1000), "0:01");
+        assert_eq!(format_duration_ms(65_000), "1:05");
+        assert_eq!(format_duration_ms(59_999), "0:59");
+        assert_eq!(format_duration_ms(3_600_000), "60:00");
+    }
+
+    #[test]
+    fn format_duration_secs_cases() {
+        assert_eq!(format_duration_secs(0), "0:00");
+        assert_eq!(format_duration_secs(9), "0:09");
+        assert_eq!(format_duration_secs(75), "1:15");
+        assert_eq!(format_duration_secs(600), "10:00");
+    }
+
+    #[test]
+    fn draw_rect_blends_opaque_and_skips_transparent() {
+        let mut img = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+
+        draw_rect(&mut img, 1, 1, 2, 2, Rgba([255, 255, 255, 255]));
+        assert_eq!(*img.get_pixel(1, 1), Rgba([255, 255, 255, 255]));
+        assert_eq!(*img.get_pixel(2, 2), Rgba([255, 255, 255, 255]));
+        // Untouched outside the rect.
+        assert_eq!(*img.get_pixel(0, 0), Rgba([10, 20, 30, 255]));
+        assert_eq!(*img.get_pixel(3, 3), Rgba([10, 20, 30, 255]));
+
+        // Fully transparent color leaves the image alone.
+        draw_rect(&mut img, 0, 0, 4, 4, Rgba([99, 99, 99, 0]));
+        assert_eq!(*img.get_pixel(0, 0), Rgba([10, 20, 30, 255]));
+        assert_eq!(*img.get_pixel(1, 1), Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn draw_rect_clamps_to_image_bounds() {
+        let mut img = RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]));
+        draw_rect(&mut img, 3, 3, 10, 10, Rgba([255, 255, 255, 255]));
+        assert_eq!(*img.get_pixel(3, 3), Rgba([255, 255, 255, 255]));
+        assert_eq!(*img.get_pixel(0, 0), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn rgba_to_i420_planes_size_even_dimensions() {
+        let img = RgbaImage::from_pixel(2, 2, Rgba([0, 0, 0, 255]));
+        let i420 = rgba_to_i420(&img);
+        // 4 luma + 2 * (1 chroma plane)
+        assert_eq!(i420.len(), 6);
+    }
+
+    #[test]
+    fn rgba_to_i420_planes_size_odd_dimensions() {
+        let img = RgbaImage::from_pixel(3, 2, Rgba([0, 0, 0, 255]));
+        let i420 = rgba_to_i420(&img);
+        // 6 luma + 2 * (2 x 1 chroma), chroma rounds up
+        assert_eq!(i420.len(), 6 + 2 * 2);
+    }
+
+    #[test]
+    fn rgba_to_i420_black_is_neutral_chroma() {
+        let img = RgbaImage::from_pixel(2, 2, Rgba([0, 0, 0, 255]));
+        let i420 = rgba_to_i420(&img);
+        assert!(i420[..4].iter().all(|&v| v == 0), "luma should be 0");
+        assert_eq!(&i420[4..], &[128, 128], "chroma should be neutral");
+    }
+
+    #[test]
+    fn rgba_to_i420_known_red_conversion() {
+        let img = RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]));
+        let i420 = rgba_to_i420(&img);
+        // Y = 0.299*255 = 76.245 -> 76
+        assert!(i420[..4].iter().all(|&v| v == 76));
+        // U = -0.169*255 + 128 = 84.9 -> 84
+        // V =  0.500*255 + 128 = 255.5 -> 255
+        assert_eq!(&i420[4..], &[84, 255]);
+    }
+
+    #[test]
+    fn renderer_round_trip_with_small_frames() {
+        let bg = RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255]));
+        let lyrics = Arc::new(vec![line(0, "first"), line(1000, "second")]);
+        let renderer = KaraokeRenderer::new(
+            bg.clone(),
+            lyrics,
+            "Title".to_owned(),
+            "Artist".to_owned(),
+            3.0,
+        )
+        .expect("renderer should build with bundled fonts");
+
+        let frame = renderer.render_frame(500, 0, 0);
+        assert_eq!(frame.width(), 64);
+        assert_eq!(frame.height(), 64);
+        // The overlay step forces full alpha on every pixel.
+        assert!(frame.pixels().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn renderer_hot_swaps_background_and_lyrics() {
+        let bg = RgbaImage::from_pixel(32, 32, Rgba([0, 0, 0, 255]));
+        let renderer = KaraokeRenderer::new(
+            bg,
+            Arc::new(vec![line(0, "a")]),
+            "T".to_owned(),
+            "A".to_owned(),
+            1.0,
+        )
+        .unwrap();
+
+        renderer.set_background(RgbaImage::from_pixel(32, 32, Rgba([200, 200, 200, 255])));
+        renderer.set_lyrics(vec![line(0, "b"), line(500, "c")]);
+        let frame = renderer.render_frame(700, 0, 0);
+        assert_eq!(frame.width(), 32);
+    }
+
+    #[test]
+    fn renderer_without_lyrics_or_duration_renders() {
+        let bg = RgbaImage::from_pixel(16, 16, Rgba([1, 2, 3, 255]));
+        let renderer =
+            KaraokeRenderer::new(bg, Arc::new(vec![]), String::new(), String::new(), 0.0).unwrap();
+        // Empty lyrics take the "no synced lyrics" branch; duration 0 skips
+        // the progress bar. Both must not panic.
+        let frame = renderer.render_frame(0, 0, 0);
+        assert_eq!(frame.width(), 16);
+    }
+}
