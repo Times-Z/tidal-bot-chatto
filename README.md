@@ -194,7 +194,7 @@ Links are resolved directly, no search involved:
 ```
 
 Track links enqueue one track; album and playlist links enqueue all
-their tracks (up to 50 / 100 respectively). Artist links are not
+their tracks (up to 50 / 1000 respectively). Artist links are not
 supported yet.
 
 The bot only reacts when it is addressed: either with the namespaced
