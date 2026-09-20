@@ -384,7 +384,7 @@ impl Bot {
             return Ok(());
         }
 
-        let mut tidal = self.tidal.lock().await;
+        let tidal = self.tidal.lock().await;
         let results = tidal.search(query, 5).await?;
         drop(tidal);
 
@@ -631,7 +631,7 @@ impl Bot {
             };
 
             let stream = {
-                let mut tidal = self.tidal.lock().await;
+                let tidal = self.tidal.lock().await;
                 match tidal.stream_track(track.tid).await {
                     Ok(stream) => stream,
                     Err(err) => {
@@ -1024,30 +1024,47 @@ impl Bot {
         tokio::spawn(async move {
             let start = Instant::now();
 
-            let lyrics =
-                karaoke::fetch_lyrics(&tidal, track.tid, &track.title, &track.artist).await;
-
-            let bg = if !track.cover_url.is_empty() {
-                load_background(&track.cover_url).await
-            } else {
-                create_gradient_background(1920, 1080)
-            };
-
-            let lyrics_arc = lyrics.unwrap_or_else(|| Arc::new(Vec::new()));
-
+            // Start sharing immediately with a gradient background and no
+            // lyrics; real content is hot-swapped in as each fetch completes
+            // so the screenshare never waits on the network to appear.
             let renderer = match KaraokeRenderer::new(
-                bg,
-                lyrics_arc,
+                create_gradient_background(1920, 1080),
+                Arc::new(Vec::new()),
                 track.title.clone(),
                 track.artist.clone(),
                 track.duration as f64,
             ) {
-                Ok(r) => r,
+                Ok(r) => Arc::new(r),
                 Err(e) => {
                     tracing::error!(error = e, "failed to create karaoke renderer");
                     return;
                 }
             };
+
+            {
+                let tidal = tidal.clone();
+                let renderer = Arc::clone(&renderer);
+                let title = track.title.clone();
+                let artist = track.artist.clone();
+                let rid = rid.clone();
+                tokio::spawn(async move {
+                    if let Some(lines) =
+                        karaoke::fetch_lyrics(&tidal, track.tid, &title, &artist).await
+                    {
+                        renderer.set_lyrics(Arc::unwrap_or_clone(lines));
+                        tracing::info!(room = %rid, "karaoke lyrics ready");
+                    }
+                });
+            }
+
+            if !track.cover_url.is_empty() {
+                let renderer = Arc::clone(&renderer);
+                let cover_url = track.cover_url.clone();
+                tokio::spawn(async move {
+                    let bg = load_background(&cover_url).await;
+                    renderer.set_background(bg);
+                });
+            }
 
             // Wait for the video source from the voice connection
             let source = loop {
@@ -1089,24 +1106,29 @@ impl Bot {
 }
 
 async fn load_background(url: &str) -> image::RgbaImage {
-    match reqwest::get(url).await {
-        Ok(resp) if resp.status().is_success() => {
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(_) => return create_gradient_background(1920, 1080),
-            };
-            match image::load_from_memory(&bytes) {
-                Ok(img) => {
-                    let resized =
-                        img.resize_exact(1920, 1080, image::imageops::FilterType::Lanczos3);
+    let bytes = match reqwest::get(url).await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(b) => b,
+            Err(_) => return create_gradient_background(1920, 1080),
+        },
+        _ => return create_gradient_background(1920, 1080),
+    };
 
-                    image::imageops::blur(&resized.to_rgba8(), 24.0)
-                }
-                Err(_) => create_gradient_background(1920, 1080),
+    // Decoding + blurring are CPU-heavy: run off the async runtime so the
+    // voice loop stays responsive. Blur at 1/6 scale (radius scales with it)
+    // then upscale; visually identical for a background, far cheaper.
+    tokio::task::spawn_blocking(move || -> image::RgbaImage {
+        match image::load_from_memory(&bytes) {
+            Ok(img) => {
+                let small = img.resize_exact(320, 180, image::imageops::FilterType::Lanczos3);
+                let blurred = image::imageops::blur(&small.to_rgba8(), 4.0);
+                image::imageops::resize(&blurred, 1920, 1080, image::imageops::FilterType::Triangle)
             }
+            Err(_) => create_gradient_background(1920, 1080),
         }
-        _ => create_gradient_background(1920, 1080),
-    }
+    })
+    .await
+    .unwrap_or_else(|_| create_gradient_background(1920, 1080))
 }
 
 fn create_gradient_background(w: u32, h: u32) -> image::RgbaImage {

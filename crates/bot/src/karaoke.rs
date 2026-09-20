@@ -1,4 +1,5 @@
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use arc_swap::ArcSwap;
 use image::{Rgba, RgbaImage};
 use std::sync::Arc;
 use tidal::LyricLine;
@@ -78,8 +79,12 @@ fn urlencoding(s: &str) -> String {
 pub struct KaraokeRenderer {
     font: FontArc,
     font_bold: FontArc,
-    bg: RgbaImage,
-    lyrics: Arc<Vec<LyricLine>>,
+    /// Hot-swappable so screensharing can start immediately with a gradient
+    /// and pick up the real cover art once it has been fetched and blurred.
+    bg: Arc<ArcSwap<RgbaImage>>,
+    /// Hot-swappable: lyrics arrive after the first frames are already
+    /// rendered (Tidal, then LRCLib fallback can take seconds).
+    lyrics: Arc<ArcSwap<Vec<LyricLine>>>,
     title: String,
     artist: String,
     duration_secs: f64,
@@ -110,16 +115,24 @@ impl KaraokeRenderer {
         Ok(Self {
             font,
             font_bold,
-            bg,
-            lyrics,
+            bg: Arc::new(ArcSwap::from_pointee(bg)),
+            lyrics: Arc::new(ArcSwap::from_pointee(Arc::unwrap_or_clone(lyrics))),
             title,
             artist,
             duration_secs,
         })
     }
 
+    pub fn set_background(&self, bg: RgbaImage) {
+        self.bg.store(Arc::new(bg));
+    }
+
+    pub fn set_lyrics(&self, lyrics: Vec<LyricLine>) {
+        self.lyrics.store(Arc::new(lyrics));
+    }
+
     pub fn render_frame(&self, elapsed_ms: u64, _width: u32, _height: u32) -> RgbaImage {
-        let mut frame = self.bg.clone();
+        let mut frame = self.bg.load_full().as_ref().clone();
 
         let overlay_color = Rgba([0, 0, 0, 140]);
         for pixel in frame.pixels_mut() {
@@ -203,13 +216,14 @@ impl KaraokeRenderer {
         );
 
         // Lyrics
-        if !self.lyrics.is_empty() {
-            let current_idx = find_current_line(&self.lyrics, elapsed_ms);
+        let lyrics = self.lyrics.load_full();
+        if !lyrics.is_empty() {
+            let current_idx = find_current_line(&lyrics, elapsed_ms);
             let mid = h * 0.5;
 
             // Previous line
-            if current_idx > 0 && current_idx < self.lyrics.len() {
-                let prev = &self.lyrics[current_idx - 1];
+            if current_idx > 0 && current_idx < lyrics.len() {
+                let prev = &lyrics[current_idx - 1];
                 draw_text_centered(
                     &mut frame,
                     &self.font,
@@ -222,8 +236,8 @@ impl KaraokeRenderer {
             }
 
             // Current line (large)
-            if current_idx < self.lyrics.len() {
-                let curr = &self.lyrics[current_idx];
+            if current_idx < lyrics.len() {
+                let curr = &lyrics[current_idx];
                 draw_text_centered(
                     &mut frame,
                     &self.font_bold,
@@ -236,8 +250,8 @@ impl KaraokeRenderer {
             }
 
             // Next line
-            if current_idx + 1 < self.lyrics.len() {
-                let next = &self.lyrics[current_idx + 1];
+            if current_idx + 1 < lyrics.len() {
+                let next = &lyrics[current_idx + 1];
                 draw_text_centered(
                     &mut frame,
                     &self.font,

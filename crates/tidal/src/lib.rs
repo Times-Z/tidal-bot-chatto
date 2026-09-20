@@ -1,24 +1,32 @@
 #![deny(unsafe_code)]
 
+//! Thin adapter over the [`tidalrs`] crate.
+//!
+//! `tidalrs` handles OAuth device-flow authentication, automatic token
+//! refresh, search and streaming. Lyrics are fetched with a small hand-rolled
+//! request here because `tidalrs` does not expose that Tidal endpoint yet.
+//! Token persistence to `tidal_token.json` is wired through the client's
+//! refresh callback so long-running services keep a valid credential on disk.
+
+use arc_swap::ArcSwapOption;
 use base64::Engine;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client as HttpClient, Method, StatusCode};
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::fs;
+use reqwest::header::AUTHORIZATION;
+use reqwest::{Client as HttpClient, StatusCode};
+use serde::Deserialize;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tidalrs::{AudioQuality, Authz, Error as TidalrsError, ResourceType, SearchQuery, TidalClient};
 use tokio::time::sleep;
 use url::Url;
 
 const TIDAL_API_BASE: &str = "https://api.tidal.com/v1";
-const DEVICE_AUTH_URL: &str = "https://auth.tidal.com/v1/oauth2/device_authorization";
-const TOKEN_URL: &str = "https://auth.tidal.com/v1/oauth2/token";
+const DEFAULT_COUNTRY_CODE: &str = "US";
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_ENCODED_CLIENT: &str =
     "NE4zbjZRMXg5NUxMNUs3cDtvS09YZkpXMzcxY1g2eGFaMFB5aGdHTkJkTkxsQlpkNEFLS1lvdWdNamlrPQ==";
-const DEFAULT_COUNTRY_CODE: &str = "US";
 
 pub const QUALITY_LOW: &str = "LOW";
 pub const QUALITY_HIGH: &str = "HIGH";
@@ -27,30 +35,24 @@ pub const QUALITY_HI_RES_LOSSLESS: &str = "HI_RES_LOSSLESS";
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("token read: {0}")]
-    TokenRead(io::Error),
-    #[error("token write: {0}")]
-    TokenWrite(io::Error),
-    #[error("token parse: {0}")]
-    TokenParse(serde_json::Error),
+    #[error("tidal api: {0}")]
+    Tidalrs(#[from] TidalrsError),
     #[error("http request: {0}")]
     Http(reqwest::Error),
     #[error("api error (status {status}): {body}")]
     Api { status: StatusCode, body: String },
     #[error("parse response: {0}")]
     ParseResponse(serde_json::Error),
+    #[error("token read: {0}")]
+    TokenRead(io::Error),
+    #[error("token parse: {0}")]
+    TokenParse(serde_json::Error),
     #[error("invalid default credentials")]
     InvalidDefaultCredentials,
-    #[error("device auth request failed (status {status}): {body}")]
-    DeviceAuthRequest { status: StatusCode, body: String },
-    #[error("device code expired")]
-    DeviceCodeExpired,
-    #[error("oauth error: {0} ({1})")]
-    OAuth(String, String),
-    #[error("unexpected response (status {status}): {body}")]
-    UnexpectedResponse { status: StatusCode, body: String },
-    #[error("missing stream url in playback manifest")]
+    #[error("missing stream url in playback response")]
     MissingStreamUrl,
+    #[error("not authenticated")]
+    NotAuthenticated,
     #[error("parse URL: {0}")]
     ParseUrl(url::ParseError),
     #[error("empty URL")]
@@ -63,52 +65,16 @@ pub enum Error {
     UnsupportedContentType(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OAuthToken {
-    #[serde(rename = "access_token")]
-    pub access_token: String,
-    #[serde(rename = "token_type")]
-    pub token_type: String,
-    #[serde(rename = "refresh_token")]
-    pub refresh_token: Option<String>,
-    #[serde(rename = "expires_at", default)]
-    pub expires_at: Option<i64>,
-    #[serde(default)]
-    pub scope: String,
-}
-
-impl OAuthToken {
-    fn auth_header(&self) -> String {
-        if self.token_type.trim().is_empty() {
-            format!("Bearer {}", self.access_token)
-        } else {
-            format!("{} {}", self.token_type, self.access_token)
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        match self.expires_at {
-            Some(expires_at) => now_unix() >= expires_at,
-            None => false,
-        }
-    }
-}
-
 pub fn cover_url(image_cover: &str) -> String {
-    format!("https://resources.tidal.com/images/{image_cover}/320x320.jpg")
+    // Tidal cover IDs are UUID-like strings; the image CDN expects slashes.
+    format!(
+        "https://resources.tidal.com/images/{}/320x320.jpg",
+        image_cover.replace('-', "/")
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
-    pub id: u64,
-    pub title: String,
-    pub artist: String,
-    pub duration: i32,
-    pub cover_url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Track {
     pub id: u64,
     pub title: String,
     pub artist: String,
@@ -137,7 +103,6 @@ pub struct Lyrics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackStream {
     pub stream_url: String,
-    pub duration: i32,
     pub quality: String,
     pub codec: String,
     pub bit_depth: i32,
@@ -183,8 +148,8 @@ pub enum TidalContentType {
     Artist,
 }
 
-impl fmt::Display for TidalContentType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for TidalContentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TidalContentType::Track => f.write_str("track"),
             TidalContentType::Album => f.write_str("album"),
@@ -194,206 +159,157 @@ impl fmt::Display for TidalContentType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
+    inner: Arc<TidalClient>,
+    /// Mirror of the credential held by `tidalrs` (which does not expose a
+    /// getter), kept in sync through the refresh callback and used for the
+    /// hand-rolled lyrics request.
+    authz: Arc<ArcSwapOption<Authz>>,
     http: HttpClient,
-    token_path: PathBuf,
-    token: OAuthToken,
-    quality: String,
-    country_code: String,
+    quality: AudioQuality,
+    quality_label: String,
 }
 
 impl Client {
     pub async fn new(token_path: impl AsRef<Path>, quality: &str) -> Result<Self, Error> {
         let token_path = token_path.as_ref().to_path_buf();
-        let http = HttpClient::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(Error::Http)?;
-
-        let token = match load_saved_token(&token_path)? {
-            Some(tok) => tok,
-            None => device_auth(&http, &token_path).await?,
+        let (client_id, client_secret) = default_credentials()?;
+        let quality_label = parse_quality(quality).to_owned();
+        let audio_quality = match quality_label.as_str() {
+            QUALITY_LOW => AudioQuality::Low,
+            QUALITY_HIGH => AudioQuality::High,
+            QUALITY_LOSSLESS => AudioQuality::Lossless,
+            QUALITY_HI_RES_LOSSLESS => AudioQuality::HiResLossless,
+            // No (or unrecognized) configuration: request the best available.
+            _ => AudioQuality::HiResLossless,
         };
 
-        let mut client = Self {
-            http,
-            token_path,
-            token,
-            quality: parse_quality(quality).to_owned(),
-            country_code: DEFAULT_COUNTRY_CODE.to_owned(),
-        };
+        let authz_mirror: Arc<ArcSwapOption<Authz>> = Arc::new(ArcSwapOption::empty());
 
-        client.ensure_valid_token().await?;
-        Ok(client)
-    }
+        // Persist every automatic token refresh so restarts reuse a valid
+        // credential, and mirror it for the hand-rolled lyrics endpoint.
+        let save_path = token_path.clone();
+        let mirror = authz_mirror.clone();
+        let mut inner = TidalClient::new(client_id).with_authz_refresh_callback(move |authz| {
+            let _ = save_token(&save_path, &authz);
+            mirror.store(Some(Arc::new(authz)));
+        });
 
-    pub async fn search(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>, Error> {
-        self.ensure_valid_token().await?;
-
-        let url = Url::parse_with_params(
-            &format!("{TIDAL_API_BASE}/search/tracks"),
-            &[
-                ("query", query.to_owned()),
-                ("limit", limit.to_string()),
-                ("offset", "0".to_owned()),
-                ("countryCode", self.country_code.clone()),
-            ],
-        )
-        .map_err(Error::ParseUrl)?;
-
-        let response = self
-            .http
-            .request(Method::GET, url)
-            .header(AUTHORIZATION, self.token.auth_header())
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-        if !status.is_success() {
-            return Err(Error::Api { status, body });
+        match load_saved_token(&token_path)? {
+            Some(authz) => {
+                authz_mirror.store(Some(Arc::new(authz.clone())));
+                inner = inner.with_authz(authz);
+            }
+            None => {
+                let device_auth = inner.device_authorization().await?;
+                print_device_prompt(&device_auth);
+                let authz =
+                    poll_device_auth(&inner, &device_auth.device_code, &client_secret).await?;
+                save_token(&token_path, &authz)?;
+                authz_mirror.store(Some(Arc::new(authz)));
+            }
         }
 
-        let parsed: SearchResponse = serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-        let results = parsed
-            .items
-            .into_iter()
-            .map(|item| {
-                let artist = artist_name(&item);
-                let cover = track_cover_url(&item);
-                SearchResult {
-                    id: item.id,
-                    title: item.title,
-                    artist,
-                    duration: item.duration,
-                    cover_url: cover,
-                }
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    pub fn selected_quality(&self) -> &str {
-        &self.quality
-    }
-
-    pub async fn get_album_tracks(&mut self, album_id: u64) -> Result<Vec<SearchResult>, Error> {
-        let path = format!("/albums/{album_id}/items");
-        let data: WrappedItemsResponse = self.get_items_endpoint(&path).await?;
-        Ok(data
-            .items
-            .into_iter()
-            .map(|it| {
-                let artist = artist_name(&it.item);
-                let cover = track_cover_url(&it.item);
-                SearchResult {
-                    id: it.item.id,
-                    title: it.item.title,
-                    artist,
-                    duration: it.item.duration,
-                    cover_url: cover,
-                }
-            })
-            .collect())
-    }
-
-    pub async fn get_playlist_tracks(
-        &mut self,
-        playlist_id: &str,
-    ) -> Result<Vec<SearchResult>, Error> {
-        let path = format!("/playlists/{}/items", urlencoding::encode(playlist_id));
-        let data: WrappedItemsResponse = self.get_items_endpoint(&path).await?;
-        Ok(data
-            .items
-            .into_iter()
-            .map(|it| {
-                let artist = artist_name(&it.item);
-                let cover = track_cover_url(&it.item);
-                SearchResult {
-                    id: it.item.id,
-                    title: it.item.title,
-                    artist,
-                    duration: it.item.duration,
-                    cover_url: cover,
-                }
-            })
-            .collect())
-    }
-
-    pub async fn get_artist_top_tracks(
-        &mut self,
-        artist_id: u64,
-    ) -> Result<Vec<SearchResult>, Error> {
-        let path = format!("/artists/{artist_id}/toptracks");
-        let data: SearchResponse = self.get_items_endpoint(&path).await?;
-        Ok(data
-            .items
-            .into_iter()
-            .map(|item| {
-                let artist = artist_name(&item);
-                let cover = track_cover_url(&item);
-                SearchResult {
-                    id: item.id,
-                    title: item.title,
-                    artist,
-                    duration: item.duration,
-                    cover_url: cover,
-                }
-            })
-            .collect())
-    }
-
-    pub async fn get_track(&mut self, id: u64) -> Result<Track, Error> {
-        self.ensure_valid_token().await?;
-
-        let url = Url::parse_with_params(
-            &format!("{TIDAL_API_BASE}/tracks/{id}"),
-            &[("countryCode", self.country_code.clone())],
-        )
-        .map_err(Error::ParseUrl)?;
-
-        let response = self
-            .http
-            .request(Method::GET, url)
-            .header(AUTHORIZATION, self.token.auth_header())
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-        if !status.is_success() {
-            return Err(Error::Api { status, body });
-        }
-
-        let item: TidalTrack = serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-        let artist = artist_name(&item);
-        let cover = track_cover_url(&item);
-        Ok(Track {
-            id: item.id,
-            title: item.title,
-            artist,
-            duration: item.duration,
-            cover_url: cover,
+        Ok(Self {
+            inner: Arc::new(inner),
+            authz: authz_mirror,
+            http: HttpClient::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .map_err(Error::Http)?,
+            quality: audio_quality,
+            quality_label,
         })
     }
 
-    pub async fn get_lyrics(&mut self, id: u64) -> Result<Lyrics, Error> {
-        self.ensure_valid_token().await?;
+    pub fn selected_quality(&self) -> &str {
+        if self.quality_label.is_empty() {
+            QUALITY_HI_RES_LOSSLESS
+        } else {
+            &self.quality_label
+        }
+    }
+
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, Error> {
+        let mut search = SearchQuery::new(query);
+        search.limit = Some(limit as u32);
+        search.search_types = Some(vec![ResourceType::Track]);
+
+        let results = self.inner.search(search).await?;
+        Ok(results
+            .tracks
+            .items
+            .into_iter()
+            .map(|track| SearchResult {
+                id: track.id,
+                title: track.title,
+                artist: artist_display(&track.artists),
+                duration: track.duration as i32,
+                cover_url: track
+                    .album
+                    .cover
+                    .as_deref()
+                    .map(cover_url)
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Resolve a playable stream URL plus audio metadata for ffmpeg.
+    ///
+    /// `urlpostpaywall` (via `tidalrs`) gives the URL and codec; playback
+    /// info adds bit depth / sample rate for the listening-quality line and
+    /// is fetched best-effort so playback still works if it fails.
+    pub async fn stream_track(&self, id: u64) -> Result<TrackStream, Error> {
+        let stream = self.inner.track_stream(id, self.quality).await?;
+        let stream_url = stream
+            .urls
+            .first()
+            .cloned()
+            .ok_or(Error::MissingStreamUrl)?;
+
+        let info = self.inner.track_playback_info(id, self.quality).await.ok();
+
+        Ok(TrackStream {
+            stream_url,
+            quality: info
+                .as_ref()
+                .map(|i| i.audio_quality.clone())
+                .unwrap_or_else(|| stream.audio_quality.as_ref().to_owned()),
+            codec: stream.codec,
+            bit_depth: info
+                .as_ref()
+                .and_then(|i| i.bit_depth)
+                .map(i32::from)
+                .unwrap_or(0),
+            sample_rate: info
+                .as_ref()
+                .and_then(|i| i.sample_rate)
+                .map(|v| v as i32)
+                .unwrap_or(0),
+        })
+    }
+
+    /// Lyrics endpoint not covered by `tidalrs`; called directly with the
+    /// current access token mirrored from the client.
+    pub async fn get_lyrics(&self, id: u64) -> Result<Lyrics, Error> {
+        let authz = self.authz.load_full().ok_or(Error::NotAuthenticated)?;
+        let country = authz
+            .country_code
+            .clone()
+            .unwrap_or_else(|| DEFAULT_COUNTRY_CODE.to_owned());
 
         let url = Url::parse_with_params(
             &format!("{TIDAL_API_BASE}/tracks/{id}/lyrics"),
-            &[("countryCode", self.country_code.clone())],
+            &[("countryCode", country)],
         )
         .map_err(Error::ParseUrl)?;
 
         let response = self
             .http
-            .request(Method::GET, url)
-            .header(AUTHORIZATION, self.token.auth_header())
+            .get(url)
+            .header(AUTHORIZATION, format!("Bearer {}", authz.access_token))
             .send()
             .await
             .map_err(Error::Http)?;
@@ -405,298 +321,116 @@ impl Client {
         }
 
         #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct TidalLyricsResponse {
-            #[serde(default)]
-            track_id: Option<u64>,
+        #[serde(rename_all = "camelCase")]
+        struct LyricsResponse {
             #[serde(default)]
             lyrics: Option<String>,
             #[serde(default)]
             plain_lyrics: Option<String>,
         }
 
-        let parsed: TidalLyricsResponse =
-            serde_json::from_str(&body).map_err(Error::ParseResponse)?;
+        let parsed: LyricsResponse = serde_json::from_str(&body).map_err(Error::ParseResponse)?;
 
         let plain = parsed
             .plain_lyrics
             .or_else(|| parsed.lyrics.clone())
             .unwrap_or_default();
 
-        let raw = parsed.lyrics.unwrap_or_default();
-        let lines = parse_lrc(&raw);
+        let lines = parse_lrc(&parsed.lyrics.unwrap_or_default());
 
         Ok(Lyrics { lines, plain })
     }
+}
 
-    pub async fn stream_track(&mut self, id: u64) -> Result<TrackStream, Error> {
-        self.ensure_valid_token().await?;
+fn artist_display(artists: &[tidalrs::ArtistSummary]) -> String {
+    artists
+        .iter()
+        .map(|artist| artist.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-        let quality = if self.quality.is_empty() {
-            QUALITY_HI_RES_LOSSLESS
-        } else {
-            self.quality.as_str()
-        };
-
-        let url = Url::parse_with_params(
-            &format!("{TIDAL_API_BASE}/tracks/{id}/playbackinfopostpaywall"),
-            &[
-                ("audioquality", quality.to_owned()),
-                ("playbackmode", "STREAM".to_owned()),
-                ("assetpresentation", "FULL".to_owned()),
-                ("countryCode", self.country_code.clone()),
-            ],
-        )
-        .map_err(Error::ParseUrl)?;
-
-        let response = self
-            .http
-            .request(Method::GET, url)
-            .header(AUTHORIZATION, self.token.auth_header())
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-        if !status.is_success() {
-            return Err(Error::Api { status, body });
+async fn poll_device_auth(
+    inner: &TidalClient,
+    device_code: &str,
+    client_secret: &str,
+) -> Result<Authz, Error> {
+    loop {
+        match inner.authorize(device_code, client_secret).await {
+            Ok(token) => return token.authz().ok_or(Error::NotAuthenticated),
+            // Tidal keeps answering "authorization_pending" until the user
+            // completes the browser flow; keep polling until the device code
+            // eventually expires (surfaced as a TidalApi error).
+            Err(TidalrsError::AuthorizationPending) => sleep(DEVICE_POLL_INTERVAL).await,
+            Err(err) => return Err(err.into()),
         }
-
-        let playback: PlaybackInfoResponse =
-            serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-        let manifest = decode_manifest(&playback.manifest);
-        let parsed_manifest = manifest
-            .as_deref()
-            .and_then(parse_manifest_json)
-            .unwrap_or_default();
-
-        let stream_url = parsed_manifest
-            .urls
-            .first()
-            .cloned()
-            .ok_or(Error::MissingStreamUrl)?;
-
-        Ok(TrackStream {
-            stream_url,
-            duration: playback.duration,
-            quality: if playback.audio_quality.is_empty() {
-                quality.to_owned()
-            } else {
-                playback.audio_quality
-            },
-            codec: parsed_manifest.codecs,
-            bit_depth: parsed_manifest.bit_depth,
-            sample_rate: parsed_manifest.sample_rate,
-        })
     }
+}
 
-    async fn get_items_endpoint<T: for<'de> Deserialize<'de>>(
-        &mut self,
-        path: &str,
-    ) -> Result<T, Error> {
-        self.ensure_valid_token().await?;
-        let url = Url::parse_with_params(
-            &format!("{TIDAL_API_BASE}{path}"),
-            &[
-                ("limit", "100".to_owned()),
-                ("offset", "0".to_owned()),
-                ("countryCode", self.country_code.clone()),
-            ],
-        )
-        .map_err(Error::ParseUrl)?;
+fn print_device_prompt(resp: &tidalrs::DeviceAuthorizationResponse) {
+    let mut out = io::stdout();
+    let _ = writeln!(out, "\n=== TIDAL DEVICE AUTH ===");
+    let _ = writeln!(out, "1. Open: {}", resp.url);
+    let _ = writeln!(out, "2. Enter code: {}", resp.user_code);
+    let _ = writeln!(out, "==========================\n");
+}
 
-        let response = self
-            .http
-            .request(Method::GET, url)
-            .header(AUTHORIZATION, self.token.auth_header())
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-        if !status.is_success() {
-            return Err(Error::Api { status, body });
+/// Load the saved token file. Accepts both the `Authz` JSON shape written by
+/// this adapter and the older `OAuthToken` format (extra fields are ignored,
+/// missing `user_id` defaults to 0).
+fn load_saved_token(path: &Path) -> Result<Option<Authz>, Error> {
+    match fs_read_to_string(path)? {
+        Some(content) => {
+            let value: serde_json::Value =
+                serde_json::from_str(&content).map_err(Error::TokenParse)?;
+            let field = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            let (Some(access_token), Some(refresh_token)) =
+                (field("access_token"), field("refresh_token"))
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Authz {
+                access_token,
+                refresh_token,
+                user_id: value.get("user_id").and_then(|v| v.as_u64()).unwrap_or(0),
+                country_code: field("country_code"),
+            }))
         }
-
-        serde_json::from_str(&body).map_err(Error::ParseResponse)
-    }
-
-    async fn ensure_valid_token(&mut self) -> Result<(), Error> {
-        if !self.token.is_expired() {
-            return Ok(());
-        }
-
-        let refresh_token = match self.token.refresh_token.as_deref() {
-            Some(refresh) if !refresh.is_empty() => refresh.to_owned(),
-            _ => {
-                self.token = device_auth(&self.http, &self.token_path).await?;
-                return Ok(());
-            }
-        };
-
-        let (client_id, client_secret) = default_credentials()?;
-        let body = format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={}&scope=r_usr+w_usr+w_sub",
-            refresh_token, client_id
-        );
-        let response = self
-            .http
-            .request(Method::POST, TOKEN_URL)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .basic_auth(client_id, Some(client_secret))
-            .body(body)
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-        if !status.is_success() {
-            self.token = device_auth(&self.http, &self.token_path).await?;
-            return Ok(());
-        }
-
-        let payload: TokenResponse = serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-        self.token = token_from_response(payload, self.token.refresh_token.clone());
-        save_token(&self.token_path, &self.token)?;
-        Ok(())
+        None => Ok(None),
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchResponse {
-    #[serde(default)]
-    items: Vec<TidalTrack>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WrappedItemsResponse {
-    #[serde(default)]
-    items: Vec<WrappedTrack>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WrappedTrack {
-    item: TidalTrack,
-}
-
-#[derive(Debug, Deserialize)]
-struct TidalArtist {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TidalAlbum {
-    cover: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TidalTrack {
-    id: u64,
-    #[serde(default)]
-    title: String,
-    #[serde(default, rename = "artistName")]
-    artist_name: String,
-    #[serde(default)]
-    duration: i32,
-    #[serde(default)]
-    artists: Vec<TidalArtist>,
-    #[serde(default)]
-    album: Option<TidalAlbum>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaybackInfoResponse {
-    #[serde(default)]
-    audio_quality: String,
-    #[serde(default)]
-    manifest: String,
-    #[serde(default)]
-    duration: i32,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct JsonManifest {
-    #[serde(default)]
-    urls: Vec<String>,
-    #[serde(default)]
-    codecs: String,
-    #[serde(default)]
-    bit_depth: i32,
-    #[serde(default)]
-    sample_rate: i32,
-}
-
-fn track_cover_url(t: &TidalTrack) -> String {
-    t.album
-        .as_ref()
-        .and_then(|a| a.cover.as_deref())
-        .map(cover_url)
-        .unwrap_or_default()
-}
-
-fn artist_name(t: &TidalTrack) -> String {
-    if !t.artist_name.is_empty() {
-        return t.artist_name.clone();
+fn fs_read_to_string(path: &Path) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::TokenRead(err)),
     }
-    t.artists
-        .first()
-        .map(|artist| artist.name.clone())
-        .unwrap_or_default()
 }
 
-fn decode_manifest(encoded: &str) -> Option<String> {
-    if encoded.is_empty() {
-        return None;
-    }
+fn save_token(path: &Path, authz: &Authz) -> Result<(), Error> {
+    let data = serde_json::to_string_pretty(authz).map_err(Error::TokenParse)?;
+    std::fs::write(path, data).map_err(|err| Error::TokenRead(io::Error::other(err)))
+}
 
+fn default_credentials() -> Result<(String, String), Error> {
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded))
-        .ok()?;
-
-    String::from_utf8(decoded).ok()
-}
-
-fn parse_manifest_json(raw: &str) -> Option<JsonManifest> {
-    serde_json::from_str(raw).ok()
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceAuthResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri_complete: String,
-    interval: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<i64>,
-    #[serde(default = "default_bearer")]
-    token_type: String,
-    #[serde(default)]
-    scope: String,
-}
-
-fn default_bearer() -> String {
-    "Bearer".to_owned()
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthErrorResponse {
-    error: String,
-    #[serde(default)]
-    error_description: String,
+        .decode(DEFAULT_ENCODED_CLIENT)
+        .map_err(|_| Error::InvalidDefaultCredentials)?;
+    let decoded = String::from_utf8(decoded).map_err(|_| Error::InvalidDefaultCredentials)?;
+    let mut parts = decoded.splitn(2, ';');
+    let client_id = parts.next().unwrap_or_default().to_owned();
+    let client_secret = parts.next().unwrap_or_default().to_owned();
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(Error::InvalidDefaultCredentials);
+    }
+    Ok((client_id, client_secret))
 }
 
 pub fn parse_quality(s: &str) -> &'static str {
@@ -753,141 +487,6 @@ pub fn parse_tidal_url(raw_url: &str) -> Result<(TidalContentType, String), Erro
     Ok((content_type, parts[1].to_owned()))
 }
 
-fn load_saved_token(path: &Path) -> Result<Option<OAuthToken>, Error> {
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            let token = serde_json::from_str(&content).map_err(Error::TokenParse)?;
-            Ok(Some(token))
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Error::TokenRead(err)),
-    }
-}
-
-fn save_token(path: &Path, token: &OAuthToken) -> Result<(), Error> {
-    let data = serde_json::to_string_pretty(token).map_err(Error::TokenParse)?;
-    fs::write(path, data).map_err(Error::TokenWrite)
-}
-
-fn default_credentials() -> Result<(String, String), Error> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(DEFAULT_ENCODED_CLIENT)
-        .map_err(|_| Error::InvalidDefaultCredentials)?;
-    let decoded = String::from_utf8(decoded).map_err(|_| Error::InvalidDefaultCredentials)?;
-    let mut parts = decoded.splitn(2, ';');
-    let client_id = parts.next().unwrap_or_default().to_owned();
-    let client_secret = parts.next().unwrap_or_default().to_owned();
-    if client_id.is_empty() || client_secret.is_empty() {
-        return Err(Error::InvalidDefaultCredentials);
-    }
-    Ok((client_id, client_secret))
-}
-
-async fn device_auth(http: &HttpClient, token_path: &Path) -> Result<OAuthToken, Error> {
-    let (client_id, client_secret) = default_credentials()?;
-
-    let body = format!("client_id={}&scope=r_usr+w_usr+w_sub", client_id);
-    let response = http
-        .request(Method::POST, DEVICE_AUTH_URL)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .map_err(Error::Http)?;
-
-    let status = response.status();
-    let body = response.text().await.map_err(Error::Http)?;
-
-    if !status.is_success() {
-        return Err(Error::DeviceAuthRequest { status, body });
-    }
-
-    let auth_resp: DeviceAuthResponse =
-        serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-
-    print_device_prompt(&auth_resp);
-    sleep(Duration::from_secs(2)).await;
-
-    let token = poll_device_auth(
-        http,
-        &client_id,
-        &client_secret,
-        &auth_resp.device_code,
-        auth_resp.interval.unwrap_or(2),
-    )
-    .await?;
-
-    save_token(token_path, &token)?;
-    Ok(token)
-}
-
-fn print_device_prompt(resp: &DeviceAuthResponse) {
-    let mut out = io::stdout();
-    let _ = writeln!(out, "\n=== TIDAL DEVICE AUTH ===");
-    let _ = writeln!(out, "1. Open: {}", resp.verification_uri_complete);
-    let _ = writeln!(out, "2. Enter code: {}", resp.user_code);
-    let _ = writeln!(out, "==========================\n");
-}
-
-async fn poll_device_auth(
-    http: &HttpClient,
-    client_id: &str,
-    client_secret: &str,
-    device_code: &str,
-    interval_sec: u64,
-) -> Result<OAuthToken, Error> {
-    loop {
-        let body = format!(
-            "client_id={}&device_code={}&grant_type=urn:ietf:params:oauth:grant-type:device_code&scope=r_usr+w_usr+w_sub",
-            client_id, device_code
-        );
-        let response = http
-            .request(Method::POST, TOKEN_URL)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .basic_auth(client_id, Some(client_secret))
-            .body(body)
-            .send()
-            .await
-            .map_err(Error::Http)?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(Error::Http)?;
-
-        if status.is_success() {
-            let token_resp: TokenResponse =
-                serde_json::from_str(&body).map_err(Error::ParseResponse)?;
-            return Ok(token_from_response(token_resp, None));
-        }
-
-        let err_resp: Option<OAuthErrorResponse> = serde_json::from_str(&body).ok();
-        if let Some(err_resp) = err_resp {
-            match err_resp.error.as_str() {
-                "authorization_pending" => {
-                    sleep(Duration::from_secs(interval_sec)).await;
-                    continue;
-                }
-                "expired_token" | "invalid_grant" => {
-                    return Err(Error::DeviceCodeExpired);
-                }
-                _ => return Err(Error::OAuth(err_resp.error, err_resp.error_description)),
-            }
-        }
-
-        return Err(Error::UnexpectedResponse { status, body });
-    }
-}
-
-fn token_from_response(resp: TokenResponse, fallback_refresh: Option<String>) -> OAuthToken {
-    let expires_at = resp.expires_in.map(|seconds| now_unix() + seconds);
-    OAuthToken {
-        access_token: resp.access_token,
-        token_type: resp.token_type,
-        refresh_token: resp.refresh_token.or(fallback_refresh),
-        expires_at,
-        scope: resp.scope,
-    }
-}
-
 fn parse_lrc(text: &str) -> Vec<LyricLine> {
     let mut lines = Vec::new();
     for line in text.lines() {
@@ -931,19 +530,14 @@ fn parse_lrc_timestamp(s: &str) -> Option<u64> {
     let seconds: u64 = rest[..dot].parse().ok()?;
     let millis = if dot < rest.len() {
         let frac = &rest[dot + 1..];
-        let padded = format!("{:<03}", frac);
+        // Left-align with zero padding so ".5" -> "500", ".50" -> "500",
+        // ".500" -> "500" (centi/milliiseconds).
+        let padded = format!("{:0<3}", frac);
         padded[..3].parse::<u64>().unwrap_or(0)
     } else {
         0
     };
     Some(minutes * 60_000 + seconds * 1_000 + millis)
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -956,7 +550,6 @@ mod tests {
             (
                 TrackStream {
                     stream_url: String::new(),
-                    duration: 0,
                     quality: "HI_RES_LOSSLESS".to_owned(),
                     codec: "flac".to_owned(),
                     bit_depth: 24,
@@ -967,7 +560,6 @@ mod tests {
             (
                 TrackStream {
                     stream_url: String::new(),
-                    duration: 0,
                     quality: "HIGH".to_owned(),
                     codec: "mp4a.40.2".to_owned(),
                     bit_depth: 16,
@@ -978,7 +570,6 @@ mod tests {
             (
                 TrackStream {
                     stream_url: String::new(),
-                    duration: 0,
                     quality: "LOSSLESS".to_owned(),
                     codec: "unknown".to_owned(),
                     bit_depth: 0,
@@ -989,7 +580,6 @@ mod tests {
             (
                 TrackStream {
                     stream_url: String::new(),
-                    duration: 0,
                     quality: "LOW".to_owned(),
                     codec: "flac".to_owned(),
                     bit_depth: 16,
@@ -1030,41 +620,78 @@ mod tests {
     }
 
     #[test]
-    fn artist_name_fallback() {
-        let track = TidalTrack {
-            id: 1,
-            title: String::new(),
-            artist_name: "Daft Punk".to_owned(),
-            duration: 0,
-            artists: vec![TidalArtist {
-                name: "Other".to_owned(),
-            }],
-            album: None,
-        };
-        assert_eq!(artist_name(&track), "Daft Punk");
-
-        let track = TidalTrack {
-            id: 1,
-            title: String::new(),
-            artist_name: String::new(),
-            duration: 0,
-            artists: vec![TidalArtist {
-                name: "Daft Punk".to_owned(),
-            }],
-            album: None,
-        };
-        assert_eq!(artist_name(&track), "Daft Punk");
+    fn cover_url_normalizes_dashes() {
+        assert_eq!(
+            cover_url("b8f29c4b-845c-41a9-bd4a-a7c2f4b8b9e5"),
+            "https://resources.tidal.com/images/b8f29c4b/845c/41a9/bd4a/a7c2f4b8b9e5/320x320.jpg"
+        );
     }
 
     #[test]
-    fn decode_and_parse_manifest() {
-        let manifest_json = r#"{"codecs":"flac","urls":["https://stream.example.com/audio.flac"],"bitDepth":24,"sampleRate":48000}"#;
-        let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest_json);
-        let decoded = decode_manifest(&manifest_b64).unwrap();
-        let parsed = parse_manifest_json(&decoded).unwrap();
-        assert_eq!(parsed.codecs, "flac");
-        assert_eq!(parsed.bit_depth, 24);
-        assert_eq!(parsed.sample_rate, 48000);
-        assert_eq!(parsed.urls.len(), 1);
+    fn artist_display_joins_names() {
+        let artists = vec![
+            tidalrs::ArtistSummary {
+                id: 1,
+                name: "Daft Punk".to_owned(),
+                ..Default::default()
+            },
+            tidalrs::ArtistSummary {
+                id: 2,
+                name: "The Weeknd".to_owned(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(artist_display(&artists), "Daft Punk, The Weeknd");
+        assert_eq!(artist_display(&[]), "");
+    }
+
+    #[test]
+    fn parse_lrc_timestamps() {
+        let lines = parse_lrc("[00:01.50] first\n[00:00.250] second\nnot a line");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].timestamp_ms, 250);
+        assert_eq!(lines[0].text, "second");
+        assert_eq!(lines[1].timestamp_ms, 1500);
+    }
+
+    #[test]
+    fn load_saved_token_reads_legacy_format() {
+        let dir = std::env::temp_dir().join(format!("tidal-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tidal_token.json");
+        std::fs::write(
+            &path,
+            r#"{"access_token":"a","token_type":"Bearer","refresh_token":"r","expires_at":1,"scope":"x"}"#,
+        )
+        .unwrap();
+
+        let authz = load_saved_token(&path).unwrap().unwrap();
+        assert_eq!(authz.access_token, "a");
+        assert_eq!(authz.refresh_token, "r");
+        assert_eq!(authz.user_id, 0);
+        assert_eq!(authz.country_code, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_token_roundtrips_authz() {
+        let dir = std::env::temp_dir().join(format!("tidal-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tidal_token.json");
+
+        let authz = Authz {
+            access_token: "a".to_owned(),
+            refresh_token: "r".to_owned(),
+            user_id: 42,
+            country_code: Some("FR".to_owned()),
+        };
+        save_token(&path, &authz).unwrap();
+
+        let loaded = load_saved_token(&path).unwrap().unwrap();
+        assert_eq!(loaded.user_id, 42);
+        assert_eq!(loaded.country_code.as_deref(), Some("FR"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

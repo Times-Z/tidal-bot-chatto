@@ -122,13 +122,22 @@ Defined in your Chatto configuration (`LIVEKIT_HOST` env var or config file). Th
 
 ### `tidal_token_path` — Tidal auth token
 
-The token is obtained automatically on first launch via Tidal's **device authorization flow**:
+Tidal integration is powered by the [`tidalrs`](https://crates.io/crates/tidalrs)
+crate (device flow OAuth, automatic token refresh, search, streaming).
+
+The token is obtained automatically on first launch via Tidal's **device
+authorization flow**:
 
 ```bash
 ./target/release/chatto-bot-tidal config.json
 ```
 
-The bot prints a URL and a code. Open the URL in a browser, enter the code, and authorize Tidal access. The token is saved to the specified file (default: `tidal_token.json`).
+The bot prints a URL and a code. Open the URL in a browser, enter the code,
+and authorize Tidal access. The token is saved to the specified file
+(default: `tidal_token.json`) and refreshed automatically in the background —
+the file is rewritten on every refresh. The format migrated from the old
+`OAuthToken` shape to `tidalrs::Authz`; an existing legacy token file is read
+transparently and rewritten on the first refresh.
 
 ### `tidal_quality` — Stream audio quality
 

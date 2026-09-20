@@ -5,14 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-swap = "1"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tidalrs = "0.5"
 tokio.workspace = true
 url.workspace = true
-urlencoding = "2.1"
-
-[dev-dependencies]
-mockito = "1.7"
