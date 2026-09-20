@@ -388,6 +388,10 @@ impl Bot {
             return Ok(());
         }
 
+        if let Some(url) = tidal::extract_tidal_url(query) {
+            return self.cmd_queue_link(room_id, actor_id, url).await;
+        }
+
         let tidal = self.tidal.lock().await;
         let results = tidal.search(query, 5).await?;
         drop(tidal);
@@ -401,38 +405,131 @@ impl Bot {
             return Ok(());
         }
 
-        let first = &results[0];
-        let track = Track {
-            tid: first.id,
-            title: first.title.clone(),
-            artist: first.artist.clone(),
-            duration: first.duration,
-            requestor: actor_id.to_owned(),
-            cover_url: first.cover_url.clone(),
+        self.enqueue_tracks(room_id, actor_id, &results[0..1], None)
+            .await
+    }
+
+    /// Resolve a Tidal link (track / album / playlist) and enqueue what it
+    /// points to.
+    async fn cmd_queue_link(&self, room_id: &str, actor_id: &str, url: &str) -> Result<(), Error> {
+        let (content_type, id) = match tidal::parse_tidal_url(url) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.send_message(
+                    room_id,
+                    &card("Link Error", &format!("Could not parse that link: {err}")),
+                )
+                .await;
+                return Ok(());
+            }
         };
+
+        let numeric_id = || id.parse::<u64>().ok();
+
+        let tidal = self.tidal.lock().await;
+        let outcome = match content_type {
+            tidal::TidalContentType::Track => match numeric_id() {
+                Some(tid) => tidal.track_by_id(tid).await.map(|track| vec![track]),
+                None => Err(tidal::Error::UnrecognizedUrlPath(id.clone())),
+            },
+            tidal::TidalContentType::Album => match numeric_id() {
+                Some(album_id) => tidal.album_tracks(album_id).await,
+                None => Err(tidal::Error::UnrecognizedUrlPath(id.clone())),
+            },
+            tidal::TidalContentType::Playlist => tidal.playlist_tracks(&id).await,
+            tidal::TidalContentType::Artist => {
+                drop(tidal);
+                self.send_message(
+                    room_id,
+                    &card("Link Error", "Artist links are not supported yet."),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        drop(tidal);
+
+        let tracks = match outcome {
+            Ok(tracks) if tracks.is_empty() => {
+                self.send_message(
+                    room_id,
+                    &card("Not Found", "That link has no playable tracks."),
+                )
+                .await;
+                return Ok(());
+            }
+            Ok(tracks) => tracks,
+            Err(err) => {
+                self.send_message(
+                    room_id,
+                    &card("Link Error", &format!("Tidal lookup failed: {err}")),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+
+        let label = match content_type {
+            tidal::TidalContentType::Album => Some("album"),
+            tidal::TidalContentType::Playlist => Some("playlist"),
+            _ => None,
+        };
+        self.enqueue_tracks(room_id, actor_id, &tracks, label).await
+    }
+
+    /// Add resolved tracks to the room queue and report what was added.
+    async fn enqueue_tracks(
+        &self,
+        room_id: &str,
+        actor_id: &str,
+        tracks: &[tidal::SearchResult],
+        label: Option<&str>,
+    ) -> Result<(), Error> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+
+        let added: Vec<Track> = tracks
+            .iter()
+            .map(|first| Track {
+                tid: first.id,
+                title: first.title.clone(),
+                artist: first.artist.clone(),
+                duration: first.duration,
+                requestor: actor_id.to_owned(),
+                cover_url: first.cover_url.clone(),
+            })
+            .collect();
 
         let pos = {
             let mut rooms = self.rooms.lock().await;
             let rs = rooms.entry(room_id.to_owned()).or_default();
-            rs.queue.add(track.clone());
+            for track in &added {
+                rs.queue.add(track.clone());
+            }
             rs.queue.total_len()
         };
 
-        self.send_message(
-            room_id,
-            &card(
-                "Added",
-                &format!(
-                    "{} · {} ({})\nPosition: #{}",
-                    track.title,
-                    track.artist,
-                    format_duration(track.duration),
-                    pos
-                ),
+        let first = &added[0];
+        let body = match label {
+            Some(label) => format!(
+                "{count} {label} tracks\nNext: {} · {} ({})\nPosition: #{}",
+                first.title,
+                first.artist,
+                format_duration(first.duration),
+                pos - added.len() + 1,
+                count = added.len(),
             ),
-        )
-        .await;
+            None => format!(
+                "{} · {} ({})\nPosition: #{}",
+                first.title,
+                first.artist,
+                format_duration(first.duration),
+                pos
+            ),
+        };
 
+        self.send_message(room_id, &card("Added", &body)).await;
         Ok(())
     }
 
@@ -1196,7 +1293,7 @@ fn format_duration(seconds: i32) -> String {
 fn help_message() -> String {
     card(
         "Commands",
-        "Use /chatto-tidal <command> or mention me\nplay <track>\nqueue <track>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nversion\nhelp",
+        "Use /chatto-tidal <command> or mention me\nplay <track | tidal link>\nqueue <track | tidal link>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nversion\nhelp",
     )
 }
 
@@ -1328,8 +1425,8 @@ mod tests {
         let msg = help_message();
         assert!(msg.starts_with("┌─ Commands "), "got: {msg}");
         for needle in [
-            "play <track>",
-            "queue <track>",
+            "play <track | tidal link>",
+            "queue <track | tidal link>",
             "nowplaying",
             "volume <0-200>",
             "mute / unmute",

@@ -25,6 +25,9 @@ use url::Url;
 const TIDAL_API_BASE: &str = "https://api.tidal.com/v1";
 const DEFAULT_COUNTRY_CODE: &str = "US";
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Max tracks pulled from one album or playlist link.
+const ALBUM_TRACK_LIMIT: u32 = 50;
+const PLAYLIST_TRACK_LIMIT: u32 = 100;
 const DEFAULT_ENCODED_CLIENT: &str =
     "NE4zbjZRMXg5NUxMNUs3cDtvS09YZkpXMzcxY1g2eGFaMFB5aGdHTkJkTkxsQlpkNEFLS1lvdWdNamlrPQ==";
 
@@ -63,6 +66,16 @@ pub enum Error {
     UnrecognizedUrlPath(String),
     #[error("unsupported Tidal content type: {0}")]
     UnsupportedContentType(String),
+}
+
+/// Finds a Tidal link inside free text: returns the first whitespace- or
+/// punctuation-delimited token containing `tidal.com` (case-insensitive).
+/// Works with or without the `https://` scheme, so `tidal.com/track/123`
+/// matches too. Trailing punctuation is trimmed off the token.
+pub fn extract_tidal_url(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .map(|token| token.trim_end_matches([',', '.', ')', ';', ':', '!', '?']))
+        .find(|token| token.to_ascii_lowercase().contains("tidal.com"))
 }
 
 pub fn cover_url(image_cover: &str) -> String {
@@ -241,18 +254,39 @@ impl Client {
             .tracks
             .items
             .into_iter()
-            .map(|track| SearchResult {
-                id: track.id,
-                title: track.title,
-                artist: artist_display(&track.artists),
-                duration: track.duration as i32,
-                cover_url: track
-                    .album
-                    .cover
-                    .as_deref()
-                    .map(cover_url)
-                    .unwrap_or_default(),
-            })
+            .map(search_result_from_track)
+            .collect())
+    }
+
+    /// Resolve a single track (e.g. from a `tidal.com/track/<id>` link).
+    pub async fn track_by_id(&self, id: u64) -> Result<SearchResult, Error> {
+        let track = self.inner.track(id).await?;
+        Ok(search_result_from_track(track))
+    }
+
+    /// All tracks of an album (from a `tidal.com/album/<id>` link).
+    pub async fn album_tracks(&self, id: u64) -> Result<Vec<SearchResult>, Error> {
+        let list = self
+            .inner
+            .album_tracks(id, Some(0), Some(ALBUM_TRACK_LIMIT))
+            .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(search_result_from_track)
+            .collect())
+    }
+
+    /// All tracks of a playlist (from a `tidal.com/playlist/<id>` link).
+    pub async fn playlist_tracks(&self, id: &str) -> Result<Vec<SearchResult>, Error> {
+        let list = self
+            .inner
+            .playlist_tracks(id, Some(0), Some(PLAYLIST_TRACK_LIMIT))
+            .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(search_result_from_track)
             .collect())
     }
 
@@ -348,6 +382,21 @@ fn artist_display(artists: &[tidalrs::ArtistSummary]) -> String {
         .map(|artist| artist.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn search_result_from_track(track: tidalrs::Track) -> SearchResult {
+    SearchResult {
+        id: track.id,
+        title: track.title,
+        artist: artist_display(&track.artists),
+        duration: track.duration as i32,
+        cover_url: track
+            .album
+            .cover
+            .as_deref()
+            .map(cover_url)
+            .unwrap_or_default(),
+    }
 }
 
 async fn poll_device_auth(
@@ -916,5 +965,37 @@ mod tests {
                 .to_string()
                 .contains("/browse")
         );
+    }
+
+    #[test]
+    fn extract_tidal_url_finds_links_in_text() {
+        assert_eq!(
+            extract_tidal_url("/play https://tidal.com/track/52105300/u"),
+            Some("https://tidal.com/track/52105300/u")
+        );
+        // Embedded mid-sentence, with or without scheme, case-insensitive.
+        assert_eq!(
+            extract_tidal_url("listen to tidal.com/album/123 please"),
+            Some("tidal.com/album/123")
+        );
+        assert_eq!(
+            extract_tidal_url("https://TIDAL.COM/playlist/abc-def"),
+            Some("https://TIDAL.COM/playlist/abc-def")
+        );
+        // Trailing punctuation is trimmed off the token.
+        assert_eq!(
+            extract_tidal_url("try https://tidal.com/track/9."),
+            Some("https://tidal.com/track/9")
+        );
+        assert_eq!(extract_tidal_url("no links here"), None);
+        assert_eq!(extract_tidal_url(""), None);
+    }
+
+    #[test]
+    fn extract_then_parse_roundtrips() {
+        let url = extract_tidal_url("play this https://tidal.com/track/52105300/u now").unwrap();
+        let (kind, id) = parse_tidal_url(url).unwrap();
+        assert_eq!(kind, TidalContentType::Track);
+        assert_eq!(id, "52105300");
     }
 }

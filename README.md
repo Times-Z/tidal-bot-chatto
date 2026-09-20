@@ -175,8 +175,8 @@ The bot joins the configured rooms and listens for chat commands. Defaults to `c
 
 | Command | Description |
 |---------|-------------|
-| `/chatto-tidal play <query>` | Search and play a track (text search only) |
-| `/chatto-tidal queue <query>` | Add a track to the queue |
+| `/chatto-tidal play <query \| tidal link>` | Search and play a track, or resolve a Tidal link |
+| `/chatto-tidal queue <query \| tidal link>` | Add a track to the queue (text search or link) |
 | `/chatto-tidal queue` | Show the current queue |
 | `/chatto-tidal skip` | Skip to the next track |
 | `/chatto-tidal stop` | Stop playback and clear the queue |
@@ -184,6 +184,18 @@ The bot joins the configured rooms and listens for chat commands. Defaults to `c
 | `/chatto-tidal volume <0-200>` | Show or set the global volume |
 | `/chatto-tidal version` | Show the running bot version |
 | `/chatto-tidal help` | Display available commands |
+
+Links are resolved directly, no search involved:
+
+```
+/chatto-tidal play https://tidal.com/track/52105300/u
+/chatto-tidal queue https://tidal.com/album/236663723
+/chatto-tidal queue https://tidal.com/playlist/7d81f0a4-2c3e-4a1f-9d1c-1234567890ab
+```
+
+Track links enqueue one track; album and playlist links enqueue all
+their tracks (up to 50 / 100 respectively). Artist links are not
+supported yet.
 
 The bot only reacts when it is addressed: either with the namespaced
 `/chatto-tidal` prefix, or with a mention (e.g. `@tidal_bot play ...`, with or
