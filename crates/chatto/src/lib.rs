@@ -154,9 +154,6 @@ impl Client {
         .map(|_| ())
     }
 
-    /// Chatto 0.5.0-alpha.6 moved avatar upload from `MyAccountService` to
-    /// `UserService`; the request now carries a target `user_id`. A bot API
-    /// key may only target its own account.
     pub async fn upload_avatar(&self, user_id: &str, image_data: &[u8]) -> Result<(), Error> {
         let url = format!(
             "{}/api/connect/chatto.api.v1.UserService/UploadAvatar",

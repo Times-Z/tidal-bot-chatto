@@ -1,6 +1,7 @@
 use crate::commands::{Command, is_addressed, parse_command};
 use crate::karaoke::{self, KaraokeRenderer};
 use crate::queue::{Queue, Track};
+use arc_swap::ArcSwapOption;
 use chatto::{Client as ChattoClient, RoomTimelineEvent, UserProfile};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use livekit_audio::Player as LivekitPlayer;
@@ -47,6 +48,10 @@ struct VoiceConnection {
     song_cancel: Arc<AtomicBool>,
     next_url: Arc<Mutex<Option<String>>>,
     video_source: Arc<Mutex<Option<NativeVideoSource>>>,
+    /// Set to the `Instant` the current track started playing, cleared when
+    /// it ends. The karaoke renderer reads it every frame so screenshare
+    /// activated mid-song lands on the correct lyric line instead of zero.
+    play_start: Arc<ArcSwapOption<Instant>>,
 }
 
 #[derive(Debug)]
@@ -809,6 +814,8 @@ impl Bot {
 
         let video_source: Arc<Mutex<Option<NativeVideoSource>>> = Arc::new(Mutex::new(None));
         let vs_task = video_source.clone();
+        let play_start: Arc<ArcSwapOption<Instant>> = Arc::new(ArcSwapOption::empty());
+        let ps_task = play_start.clone();
 
         let vc = Arc::clone(&voice_cancel);
         let sc = Arc::clone(&song_cancel);
@@ -938,16 +945,44 @@ impl Bot {
                 match url {
                     Some(u) => {
                         sc.store(false, Ordering::SeqCst);
+                        ps_task.store(Some(Arc::new(Instant::now())));
 
-                        let result = LivekitPlayer::play_url_on_source(
+                        // Playback blocks here for the whole track, so poll
+                        // for a mid-song `/lyrics` while it runs: the video
+                        // track is published as soon as lyrics turn on.
+                        let mut play = std::pin::pin!(LivekitPlayer::play_url_on_source(
                             &source,
                             &u,
                             sample_rate_p,
                             &vp,
                             &sc,
                             &mu,
-                        )
-                        .await;
+                        ));
+                        let result = loop {
+                            if vs_task.lock().await.is_none() {
+                                let lyrics_enabled = {
+                                    let rooms = db.lock().await;
+                                    rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled)
+                                };
+                                if lyrics_enabled
+                                    && let Ok((src, _)) = livekit_video::publish_video_track(
+                                        player.room(),
+                                        "screenshare",
+                                        livekit_video::DEFAULT_WIDTH,
+                                        livekit_video::DEFAULT_HEIGHT,
+                                    )
+                                    .await
+                                {
+                                    *vs_task.lock().await = Some(src);
+                                }
+                            }
+                            tokio::select! {
+                                r = play.as_mut() => break r,
+                                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            }
+                        };
+
+                        ps_task.store(None);
 
                         let mut rooms = db.lock().await;
                         if let Some(rs) = rooms.get_mut(&rid) {
@@ -989,6 +1024,7 @@ impl Bot {
                     song_cancel,
                     next_url,
                     video_source,
+                    play_start,
                 });
             }
         }
@@ -1168,7 +1204,7 @@ impl Bot {
             }
 
             // Wait for the video source from the voice connection
-            let source = loop {
+            let (source, play_start) = loop {
                 if cancel.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1178,7 +1214,7 @@ impl Bot {
                 {
                     let guard = v.video_source.lock().await;
                     if let Some(ref src) = *guard {
-                        break src.clone();
+                        break (src.clone(), v.play_start.clone());
                     }
                 }
                 drop(r);
@@ -1194,7 +1230,12 @@ impl Bot {
                 livekit_video::DEFAULT_HEIGHT,
                 &cancel,
                 |_timestamp_us, w, h| {
-                    let elapsed = start.elapsed().as_millis() as u64;
+                    // Anchor to the real playback start so a mid-song
+                    // `/lyrics` toggle lands on the correct lyric line.
+                    let elapsed = match play_start.load_full() {
+                        Some(playing) => playing.elapsed().as_millis() as u64,
+                        None => start.elapsed().as_millis() as u64,
+                    };
                     let frame = renderer.render_frame(elapsed, w, h);
                     frame.into_raw()
                 },
