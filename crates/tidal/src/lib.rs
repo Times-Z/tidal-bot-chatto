@@ -27,7 +27,7 @@ const DEFAULT_COUNTRY_CODE: &str = "US";
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Max tracks pulled from one album or playlist link.
 const ALBUM_TRACK_LIMIT: u32 = 50;
-const PLAYLIST_TRACK_LIMIT: u32 = 100;
+const PLAYLIST_TRACK_LIMIT: u32 = 1000;
 const DEFAULT_ENCODED_CLIENT: &str =
     "NE4zbjZRMXg5NUxMNUs3cDtvS09YZkpXMzcxY1g2eGFaMFB5aGdHTkJkTkxsQlpkNEFLS1lvdWdNamlrPQ==";
 
