@@ -59,7 +59,9 @@ Copy `config.example.json` → `config.json` and fill in the fields:
         "R1YR23T6P9wamep"
     ],
     "poll_interval": "3s",
-    "volume": 60
+    "volume": 60,
+    "default_lyrics": false,
+    "thread_replies": false
 }
 ```
 
@@ -84,6 +86,7 @@ starting empty, limited by the owner's own permissions:
 | `room.join` | Joining the rooms listed in `rooms` on startup |
 | `message.read` | Reading chat commands in those rooms |
 | `message.post` | Replying with queue/now-playing messages |
+| `message.post-in-thread` | Replying inside the thread of the command (only with `thread_replies`) |
 | `call.join` | Joining the room's voice call |
 | `call.voice` | Publishing the music track to the call |
 | `call.screenshare` | Publishing the karaoke lyrics video track (`/lyrics`) |
@@ -163,7 +166,29 @@ To find a room ID, simply open the room in your browser — the ID is in the URL
 
 ### `volume` — Default playback volume (0–200)
 
-Initial volume percentage. Can be changed at runtime with `volume`. Default: `20`.
+Initial volume percentage for each room. Can be changed at runtime per room
+with `volume`. Default: `20`.
+
+### `default_lyrics` — Karaoke screenshare on join (bool)
+
+When `true`, rooms start with the `/lyrics` karaoke screenshare already
+enabled. Default: `false`.
+
+### `thread_replies` — Answer inside the command's thread (bool)
+
+When `true`, every command response is posted as a thread reply under the
+message that invoked the bot (or under the thread the command was typed in).
+The room timeline stays clean; async messages such as *now playing*
+announcements and playback errors still go to the room. Requires the bot to
+have the `message.post-in-thread` permission — without it the bot logs a
+warning and falls back to room replies. Default: `false`.
+
+Thread commands work both ways: the bot automatically follows and polls the
+timelines of the threads it answers in (thread replies never appear in the
+room timeline), so typing `/chatto-tidal skip` or `pick 2` inside a thread
+just works and the response stays in that thread. Each room tracks its 16
+most recently used threads; older threads are dropped and their follow is
+forgotten.
 
 ## Usage
 
@@ -175,15 +200,26 @@ The bot joins the configured rooms and listens for chat commands. Defaults to `c
 
 | Command | Description |
 |---------|-------------|
-| `/chatto-tidal play <query \| tidal link>` | Search and play a track, or resolve a Tidal link |
-| `/chatto-tidal queue <query \| tidal link>` | Add a track to the queue (text search or link) |
-| `/chatto-tidal queue` | Show the current queue |
+| `/chatto-tidal play <query \| tidal link>` | Search and play a track, or resolve a Tidal link; several results are listed for `pick` |
+| `/chatto-tidal queue` | Show the current queue (pending tracks, requestors, repeat mode) |
+| `/chatto-tidal pick <n>` | Choose result *n* from the last search |
+| `/chatto-tidal playnext <query \| tidal link>` | Insert a track right after the current one |
 | `/chatto-tidal skip` | Skip to the next track |
 | `/chatto-tidal stop` | Stop playback and clear the queue |
-| `/chatto-tidal nowplaying` | Show the currently playing track |
-| `/chatto-tidal volume <0-200>` | Show or set the global volume |
+| `/chatto-tidal remove <n>` | Drop pending track *n* from the queue |
+| `/chatto-tidal move <from> <to>` | Reorder pending tracks |
+| `/chatto-tidal shuffle` | Randomize the pending queue |
+| `/chatto-tidal repeat [off\|all\|one]` | Show or set the repeat mode (no argument cycles it) |
+| `/chatto-tidal nowplaying` | Show the current track with position, requestor and audio quality |
+| `/chatto-tidal volume <0-200>` | Show or set this room's volume |
+| `/chatto-tidal mute` | Mute / unmute playback |
+| `/chatto-tidal lyrics` | Toggle the karaoke screenshare |
+| `/chatto-tidal stats` | Uptime, per-room status, Tidal quality |
 | `/chatto-tidal version` | Show the running bot version |
-| `/chatto-tidal help` | Display available commands |
+| `/chatto-tidal help [command]` | Command list, or details for one command |
+
+Short aliases are accepted too: `p`, `q`, `np`, `vol`, `rm`, `next`,
+`choose`/`pick`.
 
 Links are resolved directly, no search involved:
 
@@ -202,4 +238,4 @@ The bot only reacts when it is addressed: either with the namespaced
 without the `/`). Everything else — including other clients' slash commands —
 is left alone.
 
-The bot auto-joins the voice call when a track starts playing and stays in the call after the queue empties, ready for more tracks. Use `/stop` to leave the call.
+The bot auto-joins the voice call when a track starts playing and stays in the call after the queue empties, ready for more tracks. Use `/stop` to leave the call; the bot also leaves on shutdown and unpublishes the karaoke screenshare when `/lyrics` is toggled off.

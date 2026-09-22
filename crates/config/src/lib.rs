@@ -33,6 +33,9 @@ pub struct AppConfig {
     pub poll_interval: Duration,
     pub bot_name: String,
     pub volume: u8,
+    pub default_lyrics: bool,
+    /// Answer commands in the requesting message's thread.
+    pub thread_replies: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,6 +60,10 @@ struct RawConfig {
     bot_name: String,
     #[serde(default)]
     volume: Option<u16>,
+    #[serde(default)]
+    default_lyrics: bool,
+    #[serde(default)]
+    thread_replies: bool,
 }
 
 impl AppConfig {
@@ -96,6 +103,8 @@ impl AppConfig {
             poll_interval,
             bot_name: raw.bot_name,
             volume,
+            default_lyrics: raw.default_lyrics,
+            thread_replies: raw.thread_replies,
         };
 
         config.validate()?;
@@ -211,6 +220,8 @@ mod tests {
             poll_interval: Duration::from_secs(3),
             bot_name: String::new(),
             volume: 20,
+            default_lyrics: false,
+            thread_replies: false,
         }
     }
 
@@ -331,7 +342,9 @@ mod tests {
                 "rooms": ["r1", "r2"],
                 "poll_interval": "5s",
                 "bot_name": "my_bot",
-                "volume": 55
+                "volume": 55,
+                "default_lyrics": true,
+                "thread_replies": true
             }"#,
         );
         let cfg = AppConfig::load_from_path(&file.0).unwrap();
@@ -343,6 +356,8 @@ mod tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(5));
         assert_eq!(cfg.bot_name, "my_bot");
         assert_eq!(cfg.volume, 55);
+        assert!(cfg.default_lyrics);
+        assert!(cfg.thread_replies);
     }
 
     #[test]
@@ -354,6 +369,8 @@ mod tests {
         assert_eq!(cfg.volume, DEFAULT_VOLUME);
         assert_eq!(cfg.tidal_token_path, DEFAULT_TIDAL_TOKEN_PATH);
         assert_eq!(cfg.bot_name, "");
+        assert!(!cfg.default_lyrics);
+        assert!(!cfg.thread_replies);
     }
 
     #[test]

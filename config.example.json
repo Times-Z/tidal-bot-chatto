@@ -8,5 +8,7 @@
         "R1YR23T6P9wamep"
     ],
     "poll_interval": "3s",
-    "volume": 20
+    "volume": 20,
+    "default_lyrics": false,
+    "thread_replies": false
 }

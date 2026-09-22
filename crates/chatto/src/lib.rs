@@ -44,6 +44,32 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Reply inside a thread (needs the `message.post-in-thread` grant).
+    /// `in_reply_to` is the event being answered.
+    pub async fn create_thread_reply(
+        &self,
+        room_id: &str,
+        body: &str,
+        thread_root_event_id: &str,
+        in_reply_to: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut payload = json!({
+            "roomId": room_id,
+            "body": body,
+            "threadRootEventId": thread_root_event_id,
+        });
+        if let Some(in_reply_to) = in_reply_to {
+            payload["inReplyTo"] = json!(in_reply_to);
+        }
+        self.do_rpc::<_, serde_json::Value>(
+            "chatto.api.v1.MessageService",
+            "CreateMessage",
+            Some(payload),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// The cursor is a oneof (`before`/`after`) serialized at the top level of
     /// the request in ProtoJSON.
     pub async fn get_room_events(
@@ -60,6 +86,48 @@ impl Client {
 
         self.do_rpc("chatto.api.v1.RoomService", "GetRoomEvents", Some(req))
             .await
+    }
+
+    /// One page of a thread timeline. Same shape as `get_room_events`; omit
+    /// `after_cursor` to load the newest window, root message included.
+    pub async fn get_thread_events(
+        &self,
+        room_id: &str,
+        thread_root_event_id: &str,
+        after_cursor: &str,
+        limit: i32,
+    ) -> Result<GetRoomEventsResponse, Error> {
+        let mut req = json!({
+            "roomId": room_id,
+            "threadRootEventId": thread_root_event_id,
+            "limit": limit,
+        });
+        if !after_cursor.is_empty() {
+            req["cursor"] = json!({"after": after_cursor});
+        }
+
+        self.do_rpc("chatto.api.v1.ThreadService", "GetThreadEvents", Some(req))
+            .await
+    }
+
+    /// Follow a thread for the bot (feeds + notifications).
+    pub async fn follow_thread(
+        &self,
+        room_id: &str,
+        thread_root_event_id: &str,
+    ) -> Result<bool, Error> {
+        #[derive(Debug, Deserialize)]
+        struct Resp {
+            following: bool,
+        }
+        let resp: Resp = self
+            .do_rpc(
+                "chatto.api.v1.ThreadService",
+                "FollowThread",
+                Some(json!({"roomId": room_id, "threadRootEventId": thread_root_event_id})),
+            )
+            .await?;
+        Ok(resp.following)
     }
 
     pub async fn get_viewer(&self) -> Result<String, Error> {
@@ -394,6 +462,16 @@ pub struct Message {
     #[serde(default)]
     pub actor_id: String,
     pub body: Option<String>,
+    /// Event ID this message replies to, if any.
+    #[serde(default)]
+    pub in_reply_to: String,
+    /// Thread root this message belongs to, if threaded.
+    #[serde(default)]
+    pub thread_root_event_id: String,
+    /// Non-empty for channel echoes: a copy of a thread reply shown in the
+    /// room timeline. Skip these, the original comes through the thread.
+    #[serde(default)]
+    pub echo_of_event_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -929,6 +1007,143 @@ mod tests {
 
         let c = Client::new(&server.url(), "tok");
         c.create_message("room1", "hello").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_thread_reply_sends_root_and_attribution() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.MessageService/CreateMessage",
+            )
+            .match_body(Matcher::JsonString(
+                r#"{"body":"hi","roomId":"room1","threadRootEventId":"evt_root","inReplyTo":"evt_src"}"#
+                    .to_owned(),
+            ))
+            .with_status(200)
+            .with_body("null")
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        c.create_thread_reply("room1", "hi", "evt_root", Some("evt_src"))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_thread_reply_without_attribution_omits_field() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.MessageService/CreateMessage",
+            )
+            .match_body(Matcher::JsonString(
+                r#"{"body":"hi","roomId":"room1","threadRootEventId":"evt_root"}"#.to_owned(),
+            ))
+            .with_status(200)
+            .with_body("null")
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        c.create_thread_reply("room1", "hi", "evt_root", None)
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_message_thread_fields_default_and_parse() {
+        let msg: Message = serde_json::from_str(r#"{"id":"m1","body":"hi"}"#).unwrap();
+        assert_eq!(msg.in_reply_to, "");
+        assert_eq!(msg.thread_root_event_id, "");
+        assert_eq!(msg.echo_of_event_id, "");
+
+        let msg: Message = serde_json::from_str(
+            r#"{"id":"m2","inReplyTo":"m1","threadRootEventId":"m1","echoOfEventId":"m9"}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.in_reply_to, "m1");
+        assert_eq!(msg.thread_root_event_id, "m1");
+        assert_eq!(msg.echo_of_event_id, "m9");
+    }
+
+    #[tokio::test]
+    async fn test_get_thread_events_omits_cursor_when_empty() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents",
+            )
+            .match_body(Matcher::JsonString(
+                r#"{"limit":25,"roomId":"room1","threadRootEventId":"evt_root"}"#.to_owned(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"page":{"events":[],"endCursor":"t1"}}"#)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        let resp = c
+            .get_thread_events("room1", "evt_root", "", 25)
+            .await
+            .unwrap();
+        assert_eq!(resp.page.unwrap().end_cursor, "t1");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_thread_events_sends_nested_after_cursor() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents",
+            )
+            .match_body(Matcher::JsonString(
+                r#"{"limit":25,"roomId":"room1","threadRootEventId":"evt_root","cursor":{"after":"t1"}}"#
+                    .to_owned(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"page":{"events":[{"id":"e1"}],"endCursor":"t2"}}"#)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        let resp = c
+            .get_thread_events("room1", "evt_root", "t1", 25)
+            .await
+            .unwrap();
+        let page = resp.page.unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.end_cursor, "t2");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_follow_thread_reports_following() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/api/connect/chatto.api.v1.ThreadService/FollowThread",
+            )
+            .match_body(Matcher::JsonString(
+                r#"{"roomId":"room1","threadRootEventId":"evt_root"}"#.to_owned(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"following":true}"#)
+            .create_async()
+            .await;
+
+        let c = Client::new(&server.url(), "tok");
+        assert!(c.follow_thread("room1", "evt_root").await.unwrap());
         mock.assert_async().await;
     }
 

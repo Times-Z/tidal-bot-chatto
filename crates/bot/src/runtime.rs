@@ -1,12 +1,12 @@
-use crate::commands::{Command, is_addressed, parse_command};
+use crate::commands::{Command, command_help, is_addressed, parse_command};
 use crate::karaoke::{self, KaraokeRenderer};
-use crate::queue::{Queue, Track};
+use crate::queue::{Queue, RepeatMode, Track};
 use arc_swap::ArcSwapOption;
 use chatto::{Client as ChattoClient, RoomTimelineEvent, UserProfile};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use livekit_audio::Player as LivekitPlayer;
-use livekit_video::NativeVideoSource;
-use std::collections::{HashMap, HashSet};
+use livekit_video::{LocalVideoTrack, NativeVideoSource, Room as LivekitRoom};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +15,21 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+/// Event IDs remembered for dedup; oldest fall out past the cap.
+const SEEN_EVENTS_CAP: usize = 4096;
+
+/// Search results listed by `play` before `pick`.
+const SEARCH_PICK_LIMIT: usize = 5;
+
+/// Pending tracks listed by `queue` before truncation.
+const QUEUE_DISPLAY_LIMIT: usize = 15;
+
+/// Thread timelines followed per room (LRU).
+const MAX_WATCHED_THREADS: usize = 16;
+
+/// Events fetched per thread poll.
+const THREAD_POLL_LIMIT: i32 = 25;
+
 #[derive(Debug)]
 pub struct BotConfig {
     pub rooms: Vec<String>,
@@ -22,6 +37,10 @@ pub struct BotConfig {
     pub bot_name: String,
     pub volume: u8,
     pub sample_rate: u32,
+    /// Whether rooms start with the karaoke screenshare enabled.
+    pub default_lyrics: bool,
+    /// Reply to commands inside the thread of the requesting message.
+    pub thread_replies: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,17 +60,98 @@ struct CurrentTrack {
     stream_url: String,
 }
 
+/// Whether a queued track goes to the tail or right after the current song.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePlacement {
+    Tail,
+    Next,
+}
+
+/// Parse a 1-based index argument (first whitespace-separated token).
+fn parse_index(s: &str) -> Option<usize> {
+    s.split_whitespace()
+        .next()?
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+}
+
+/// Published screenshare track plus its frame source. Both are kept so the
+/// track can be unpublished later.
+#[derive(Debug)]
+struct VideoTrack {
+    source: NativeVideoSource,
+    track: LocalVideoTrack,
+}
+
 #[derive(Debug)]
 struct VoiceConnection {
     handle: JoinHandle<()>,
     cancel: Arc<AtomicBool>,
     song_cancel: Arc<AtomicBool>,
     next_url: Arc<Mutex<Option<String>>>,
-    video_source: Arc<Mutex<Option<NativeVideoSource>>>,
-    /// Set to the `Instant` the current track started playing, cleared when
-    /// it ends. The karaoke renderer reads it every frame so screenshare
-    /// activated mid-song lands on the correct lyric line instead of zero.
+    video: Arc<Mutex<Option<VideoTrack>>>,
+    /// Raised by `/lyrics`; the voice task unpublishes on it (only it holds
+    /// the Room).
+    video_unpublish: Arc<AtomicBool>,
+    /// When the current track started playing; None between tracks. Karaoke
+    /// reads this to stay in sync when enabled mid-song.
     play_start: Arc<ArcSwapOption<Instant>>,
+}
+
+/// Thread timelines the bot follows, each with a poll cursor. Thread replies
+/// do not show up in the room timeline, so followed threads are polled
+/// separately. Capped per room, oldest dropped first.
+#[derive(Debug, Default)]
+struct ThreadWatch {
+    cursors: HashMap<String, String>,
+    /// Watch order, oldest first; the front is evicted past the cap.
+    order: VecDeque<String>,
+}
+
+impl ThreadWatch {
+    /// Start following a thread. True when newly added (follow it
+    /// server-side).
+    fn watch(&mut self, root: &str) -> bool {
+        if self.cursors.contains_key(root) {
+            return false;
+        }
+        self.cursors.insert(root.to_owned(), String::new());
+        self.order.push_back(root.to_owned());
+        while self.order.len() > MAX_WATCHED_THREADS {
+            if let Some(old) = self.order.pop_front() {
+                self.cursors.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn advance(&mut self, root: &str, cursor: String) {
+        if cursor.is_empty() {
+            return;
+        }
+        if let Some(current) = self.cursors.get_mut(root) {
+            *current = cursor;
+        }
+    }
+
+    fn unwatch(&mut self, root: &str) {
+        self.cursors.remove(root);
+        self.order.retain(|r| r != root);
+    }
+
+    /// (root, after-cursor) pairs in watch order.
+    fn snapshot(&self) -> Vec<(String, String)> {
+        self.order
+            .iter()
+            .map(|root| {
+                (
+                    root.clone(),
+                    self.cursors.get(root).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -63,19 +163,85 @@ struct RoomState {
     voice: Option<VoiceConnection>,
     lyrics_enabled: bool,
     karaoke_cancel: Option<Arc<AtomicBool>>,
+    /// Results of the last ambiguous search, awaiting `/pick <n>`.
+    pending_search: Vec<tidal::SearchResult>,
+    /// Playback volume for this room only (0-200 percent).
+    volume: Arc<AtomicU32>,
+    /// Thread timelines polled for commands alongside the room timeline.
+    threads: ThreadWatch,
 }
 
-impl Default for RoomState {
-    fn default() -> Self {
+impl RoomState {
+    fn new(cfg: &BotConfig) -> Self {
         Self {
             queue: Queue::default(),
             current: None,
             cursor: String::new(),
             muted: Arc::new(AtomicBool::new(false)),
             voice: None,
-            lyrics_enabled: false,
+            lyrics_enabled: cfg.default_lyrics,
             karaoke_cancel: None,
+            pending_search: Vec::new(),
+            volume: Arc::new(AtomicU32::new(u32::from(cfg.volume))),
+            threads: ThreadWatch::default(),
         }
+    }
+}
+
+/// Where a command's replies go. All-None means the room timeline.
+#[derive(Debug, Clone, Default)]
+struct ReplyCtx {
+    thread_root: Option<String>,
+    source_event: Option<String>,
+}
+
+/// Who sent the command and where the reply should land.
+#[derive(Debug, Clone)]
+struct CmdCtx {
+    room_id: String,
+    actor_id: String,
+    actor_display: String,
+    reply: ReplyCtx,
+}
+
+/// Reply target for a command message: an existing thread root wins, else
+/// the message itself roots a new thread. Takes fields, not &Message: the
+/// body has already been moved by dispatch time.
+fn reply_ctx(msg_id: &str, thread_root: &str) -> ReplyCtx {
+    let root = if thread_root.is_empty() {
+        msg_id
+    } else {
+        thread_root
+    };
+    if root.is_empty() {
+        return ReplyCtx::default();
+    }
+    ReplyCtx {
+        thread_root: Some(root.to_owned()),
+        source_event: (!msg_id.is_empty()).then(|| msg_id.to_owned()),
+    }
+}
+
+/// Seen event IDs with a hard cap, so the duplicate filter cannot grow
+/// without bounds.
+#[derive(Debug)]
+struct RecentEvents {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RecentEvents {
+    fn mark_seen(&mut self, id: String) -> bool {
+        if !self.seen.insert(id.clone()) {
+            return true;
+        }
+        self.order.push_back(id);
+        while self.order.len() > SEEN_EVENTS_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        false
     }
 }
 
@@ -85,11 +251,9 @@ pub struct Bot {
     chatto: ChattoClient,
     tidal: Arc<Mutex<TidalClient>>,
     rooms: Arc<Mutex<HashMap<String, RoomState>>>,
-    volume: Arc<Mutex<f64>>,
-    volume_pct: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     started_at: DateTime<Utc>,
-    seen_events: Arc<Mutex<HashSet<String>>>,
+    seen_events: Arc<Mutex<RecentEvents>>,
     bot_user_id: Arc<Mutex<Option<String>>>,
     bot_login: Arc<Mutex<String>>,
 }
@@ -104,12 +268,10 @@ impl Bot {
         let rooms = cfg
             .rooms
             .iter()
-            .map(|room_id| (room_id.clone(), RoomState::default()))
+            .map(|room_id| (room_id.clone(), RoomState::new(&cfg)))
             .collect();
 
         Self {
-            volume: Arc::new(Mutex::new(f64::from(cfg.volume) / 100.0)),
-            volume_pct: Arc::new(AtomicU32::new(cfg.volume as u32)),
             cfg,
             livekit_url,
             chatto,
@@ -117,7 +279,10 @@ impl Bot {
             rooms: Arc::new(Mutex::new(rooms)),
             shutdown: Arc::new(AtomicBool::new(false)),
             started_at: Utc::now(),
-            seen_events: Arc::new(Mutex::new(HashSet::new())),
+            seen_events: Arc::new(Mutex::new(RecentEvents {
+                seen: HashSet::new(),
+                order: VecDeque::new(),
+            })),
             bot_user_id: Arc::new(Mutex::new(None)),
             bot_login: Arc::new(Mutex::new(String::new())),
         }
@@ -148,7 +313,6 @@ impl Bot {
         self.setup_avatar().await;
         self.join_rooms().await;
 
-        let mut poll_tick = tokio::time::interval(self.cfg.poll_interval);
         let mut presence_tick = tokio::time::interval(Duration::from_secs(45));
 
         info!(rooms = ?self.cfg.rooms, "bot runtime started");
@@ -156,11 +320,14 @@ impl Bot {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 info!("bot runtime shutdown requested");
+                self.shutdown_all().await;
                 return Ok(());
             }
 
+            let poll_dur = self.current_poll_interval().await;
+
             tokio::select! {
-                _ = poll_tick.tick() => {
+                _ = tokio::time::sleep(poll_dur) => {
                     self.reap_voice_tasks().await;
                     self.poll_all_rooms().await;
                     self.auto_prepare_playback().await;
@@ -168,6 +335,47 @@ impl Bot {
                 _ = presence_tick.tick() => {
                     self.set_presence().await;
                 }
+            }
+        }
+    }
+
+    /// Poll faster while a call is live so commands feel instant.
+    async fn current_poll_interval(&self) -> Duration {
+        let rooms = self.rooms.lock().await;
+        let active = rooms
+            .values()
+            .any(|rs| rs.voice.as_ref().is_some_and(|v| !v.handle.is_finished()));
+        if active {
+            self.cfg.poll_interval.min(Duration::from_secs(1))
+        } else {
+            self.cfg.poll_interval
+        }
+    }
+
+    /// Cancel karaoke and voice tasks and wait for them to leave the call.
+    async fn shutdown_all(&self) {
+        let handles = {
+            let mut rooms = self.rooms.lock().await;
+            let mut handles = Vec::new();
+            for rs in rooms.values_mut() {
+                if let Some(cancel) = rs.karaoke_cancel.take() {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                if let Some(voice) = rs.voice.take() {
+                    voice.cancel.store(true, Ordering::SeqCst);
+                    voice.song_cancel.store(true, Ordering::SeqCst);
+                    handles.push(voice.handle);
+                }
+            }
+            handles
+        };
+
+        for handle in handles {
+            if tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                warn!("voice task did not finish within shutdown timeout");
             }
         }
     }
@@ -243,12 +451,12 @@ impl Bot {
     }
 
     async fn poll_room(&self, room_id: &str) -> Result<(), Error> {
-        let after = {
+        let (after, watched_threads) = {
             let rooms = self.rooms.lock().await;
-            rooms
-                .get(room_id)
-                .map(|rs| rs.cursor.clone())
-                .unwrap_or_default()
+            match rooms.get(room_id) {
+                Some(rs) => (rs.cursor.clone(), rs.threads.snapshot()),
+                None => return Ok(()),
+            }
         };
 
         match self.chatto.get_room_events(room_id, &after, 50).await {
@@ -264,20 +472,73 @@ impl Bot {
                     }
 
                     for event in page.events {
-                        self.process_event(room_id, event, users).await?;
+                        self.process_event(room_id, event, users, None).await?;
                     }
                 }
-                Ok(())
             }
             Err(err)
                 if chatto::is_not_member_error(&err)
                     || chatto::is_permission_denied_error(&err) =>
             {
                 warn!(room = room_id, error = %err, "bot not a member or lacks permission");
-                Ok(())
+                return Ok(());
             }
-            Err(err) => Err(Error::Chatto(err)),
+            Err(err) => return Err(Error::Chatto(err)),
         }
+
+        // Poll the threads the bot follows; room events do not include
+        // their replies.
+        for (root, cursor) in watched_threads {
+            match self
+                .chatto
+                .get_thread_events(room_id, &root, &cursor, THREAD_POLL_LIMIT)
+                .await
+            {
+                Ok(resp) => {
+                    if let Some(page) = resp.page {
+                        let users = page.includes.as_ref().map(|inc| &inc.users);
+                        {
+                            let mut rooms = self.rooms.lock().await;
+                            if let Some(rs) = rooms.get_mut(room_id) {
+                                rs.threads.advance(&root, page.end_cursor);
+                            }
+                        }
+                        for event in page.events {
+                            // The first page repeats the root message; it was
+                            // handled through the room timeline.
+                            if event.id == root {
+                                continue;
+                            }
+                            if let Err(err) =
+                                self.process_event(room_id, event, users, Some(&root)).await
+                            {
+                                error!(
+                                    room = room_id,
+                                    thread = %root,
+                                    error = %err,
+                                    "thread event failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err)
+                    if chatto::is_not_member_error(&err)
+                        || chatto::is_permission_denied_error(&err) =>
+                {
+                    // Thread deleted or access lost: stop polling it.
+                    let mut rooms = self.rooms.lock().await;
+                    if let Some(rs) = rooms.get_mut(room_id) {
+                        rs.threads.unwatch(&root);
+                    }
+                }
+                Err(err) => {
+                    warn!(room = room_id, thread = %root, error = %err, "thread poll failed");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn process_event(
@@ -285,14 +546,21 @@ impl Bot {
         room_id: &str,
         event: RoomTimelineEvent,
         users: Option<&HashMap<String, UserProfile>>,
+        thread_hint: Option<&str>,
     ) -> Result<(), Error> {
         let Some(message_posted) = event.message_posted else {
             return Ok(());
         };
 
+        // Channel echo of a thread reply; the original comes through the
+        // thread poll.
+        if !message_posted.message.echo_of_event_id.is_empty() {
+            return Ok(());
+        }
+
         {
             let mut seen = self.seen_events.lock().await;
-            if !seen.insert(event.id.clone()) {
+            if seen.mark_seen(event.id.clone()) {
                 return Ok(());
             }
         }
@@ -330,7 +598,10 @@ impl Bot {
         let Some(parsed) = parse_command(&body, &self.cfg.bot_name) else {
             self.send_message(
                 room_id,
-                "Unknown command. Type `/chatto-tidal help` for a list of available commands.",
+                &card(
+                    "Help",
+                    "Unknown command.\nTry /chatto-tidal help for the full list.",
+                ),
             )
             .await;
             return Ok(());
@@ -349,79 +620,244 @@ impl Bot {
             "processing command"
         );
 
+        // Reply in the thread the command came from, or root a new thread
+        // at the command itself.
+        let reply = if self.cfg.thread_replies {
+            let mut rc = reply_ctx(
+                &message_posted.message.id,
+                &message_posted.message.thread_root_event_id,
+            );
+            if rc.thread_root.is_none()
+                && let Some(hint) = thread_hint
+            {
+                rc.thread_root = Some(hint.to_owned());
+                rc.source_event = (!message_posted.message.id.is_empty())
+                    .then(|| message_posted.message.id.clone());
+            }
+            rc
+        } else {
+            ReplyCtx::default()
+        };
+
+        // Keep following the thread the command came from, even when replies
+        // themselves go to the room.
+        let watch_root = thread_hint.map(str::to_owned).or_else(|| {
+            (!message_posted.message.thread_root_event_id.is_empty())
+                .then(|| message_posted.message.thread_root_event_id.clone())
+        });
+        if let Some(root) = watch_root.as_deref().or(reply.thread_root.as_deref()) {
+            self.watch_thread(room_id, root).await;
+        }
+
+        let ctx = CmdCtx {
+            room_id: room_id.to_owned(),
+            actor_id: actor_id.clone(),
+            actor_display: actor_display.to_owned(),
+            reply,
+        };
+
         match parsed.command {
             Command::Help => {
-                self.send_message(room_id, &help_message()).await;
+                self.cmd_help(&ctx, &parsed.args).await;
             }
             Command::Play | Command::Queue => {
-                self.cmd_queue(room_id, &message_posted.message.actor_id, &parsed.args)
-                    .await?;
+                self.cmd_queue(&ctx, &parsed.args).await?;
+            }
+            Command::Pick => {
+                self.cmd_pick(&ctx, &parsed.args).await?;
+            }
+            Command::PlayNext => {
+                self.cmd_playnext(&ctx, &parsed.args).await?;
             }
             Command::NowPlaying => {
-                self.cmd_now_playing(room_id).await;
+                self.cmd_now_playing(&ctx).await;
             }
             Command::Skip => {
-                self.cmd_skip(room_id).await;
+                self.cmd_skip(&ctx).await;
             }
             Command::Stop => {
-                self.cmd_stop(room_id).await;
+                self.cmd_stop(&ctx).await;
+            }
+            Command::Remove => {
+                self.cmd_remove(&ctx, &parsed.args).await;
+            }
+            Command::Move => {
+                self.cmd_move(&ctx, &parsed.args).await;
+            }
+            Command::Shuffle => {
+                self.cmd_shuffle(&ctx).await;
+            }
+            Command::Repeat => {
+                self.cmd_repeat(&ctx, &parsed.args).await;
             }
             Command::Volume => {
-                self.cmd_volume(room_id, &parsed.args).await;
+                self.cmd_volume(&ctx, &parsed.args).await;
             }
             Command::Mute => {
-                self.cmd_mute(room_id).await;
+                self.cmd_mute(&ctx).await;
             }
             Command::Test => {
-                self.cmd_test(room_id).await;
+                self.cmd_test(&ctx).await;
             }
             Command::Lyrics => {
-                self.cmd_lyrics(room_id).await;
+                self.cmd_lyrics(&ctx).await;
+            }
+            Command::Stats => {
+                self.cmd_stats(&ctx).await;
             }
             Command::Version => {
-                self.send_message(room_id, &card("Version", crate::version()))
-                    .await;
+                self.reply(&ctx, &card("Version", crate::version())).await;
             }
         }
 
         Ok(())
     }
 
-    async fn cmd_queue(&self, room_id: &str, actor_id: &str, query: &str) -> Result<(), Error> {
+    /// Search (or resolve a link) and enqueue. When a text search returns
+    /// several candidates, they are listed and the user confirms one with
+    /// `pick <n>`.
+    async fn cmd_queue(&self, ctx: &CmdCtx, query: &str) -> Result<(), Error> {
+        let room_id = ctx.room_id.as_str();
         if query.trim().is_empty() {
-            self.print_queue(room_id).await;
+            self.print_queue(ctx).await;
             return Ok(());
         }
 
         if let Some(url) = tidal::extract_tidal_url(query) {
-            return self.cmd_queue_link(room_id, actor_id, url).await;
+            return self.cmd_queue_link(ctx, url, false).await;
         }
 
-        let tidal = self.tidal.lock().await;
-        let results = tidal.search(query, 5).await?;
-        drop(tidal);
+        let tracks = {
+            let tidal = self.tidal.lock().await;
+            tidal.search(query, SEARCH_PICK_LIMIT).await?
+        };
 
-        if results.is_empty() {
-            self.send_message(
-                room_id,
+        if tracks.is_empty() {
+            self.reply(
+                ctx,
                 &card("Not Found", &format!("No results for: {}", query)),
             )
             .await;
             return Ok(());
         }
 
-        self.enqueue_tracks(room_id, actor_id, &results[0..1], None)
+        if tracks.len() == 1 {
+            return self
+                .enqueue_tracks(ctx, &tracks, None, QueuePlacement::Tail)
+                .await;
+        }
+
+        // Several candidates: remember them and let `pick` choose.
+        let listing = tracks
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| {
+                format!(
+                    "{}. {} · {} ({})",
+                    idx + 1,
+                    t.title,
+                    t.artist,
+                    format_duration(t.duration)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        {
+            let mut rooms = self.rooms.lock().await;
+            let rs = rooms
+                .entry(room_id.to_owned())
+                .or_insert_with(|| RoomState::new(&self.cfg));
+            rs.pending_search = tracks;
+        }
+        self.reply(
+            ctx,
+            &card(
+                "Search",
+                &format!("{listing}\n\npick one with: /chatto-tidal pick <n>"),
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Choose result `n` from the last search and enqueue it.
+    async fn cmd_pick(&self, ctx: &CmdCtx, args: &str) -> Result<(), Error> {
+        let room_id = ctx.room_id.as_str();
+        let Some(n) = parse_index(args) else {
+            self.reply(ctx, &card("Pick", "Usage: pick <n>")).await;
+            return Ok(());
+        };
+
+        let chosen = {
+            let mut rooms = self.rooms.lock().await;
+            match rooms.get_mut(room_id) {
+                Some(rs) if n <= rs.pending_search.len() => Some(rs.pending_search.remove(n - 1)),
+                _ => None,
+            }
+        };
+
+        match chosen {
+            Some(track) => {
+                self.enqueue_tracks(
+                    ctx,
+                    std::slice::from_ref(&track),
+                    None,
+                    QueuePlacement::Tail,
+                )
+                .await
+            }
+            None => {
+                self.reply(
+                    ctx,
+                    &card("Pick", "No pending search result at that number."),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Queue a track so it plays immediately after the current one.
+    async fn cmd_playnext(&self, ctx: &CmdCtx, query: &str) -> Result<(), Error> {
+        if query.trim().is_empty() {
+            self.reply(
+                ctx,
+                &card("Play Next", "Usage: playnext <track | tidal link>"),
+            )
+            .await;
+            return Ok(());
+        }
+
+        if let Some(url) = tidal::extract_tidal_url(query) {
+            return self.cmd_queue_link(ctx, url, true).await;
+        }
+
+        let tracks = {
+            let tidal = self.tidal.lock().await;
+            tidal.search(query, 1).await?
+        };
+
+        if tracks.is_empty() {
+            self.reply(
+                ctx,
+                &card("Not Found", &format!("No results for: {}", query)),
+            )
+            .await;
+            return Ok(());
+        }
+
+        self.enqueue_tracks(ctx, &tracks[0..1], None, QueuePlacement::Next)
             .await
     }
 
     /// Resolve a Tidal link (track / album / playlist) and enqueue what it
     /// points to.
-    async fn cmd_queue_link(&self, room_id: &str, actor_id: &str, url: &str) -> Result<(), Error> {
+    async fn cmd_queue_link(&self, ctx: &CmdCtx, url: &str, next: bool) -> Result<(), Error> {
         let (content_type, id) = match tidal::parse_tidal_url(url) {
             Ok(parsed) => parsed,
             Err(err) => {
-                self.send_message(
-                    room_id,
+                self.reply(
+                    ctx,
                     &card("Link Error", &format!("Could not parse that link: {err}")),
                 )
                 .await;
@@ -444,8 +880,8 @@ impl Bot {
             tidal::TidalContentType::Playlist => tidal.playlist_tracks(&id).await,
             tidal::TidalContentType::Artist => {
                 drop(tidal);
-                self.send_message(
-                    room_id,
+                self.reply(
+                    ctx,
                     &card("Link Error", "Artist links are not supported yet."),
                 )
                 .await;
@@ -456,17 +892,14 @@ impl Bot {
 
         let tracks = match outcome {
             Ok(tracks) if tracks.is_empty() => {
-                self.send_message(
-                    room_id,
-                    &card("Not Found", "That link has no playable tracks."),
-                )
-                .await;
+                self.reply(ctx, &card("Not Found", "That link has no playable tracks."))
+                    .await;
                 return Ok(());
             }
             Ok(tracks) => tracks,
             Err(err) => {
-                self.send_message(
-                    room_id,
+                self.reply(
+                    ctx,
                     &card("Link Error", &format!("Tidal lookup failed: {err}")),
                 )
                 .await;
@@ -479,16 +912,23 @@ impl Bot {
             tidal::TidalContentType::Playlist => Some("playlist"),
             _ => None,
         };
-        self.enqueue_tracks(room_id, actor_id, &tracks, label).await
+        let placement = if next {
+            QueuePlacement::Next
+        } else {
+            QueuePlacement::Tail
+        };
+        self.enqueue_tracks(ctx, &tracks, label, placement).await
     }
 
     /// Add resolved tracks to the room queue and report what was added.
+    /// With `QueuePlacement::Next` the first track plays right after the
+    /// current one; the rest (album/playlist) still go to the tail.
     async fn enqueue_tracks(
         &self,
-        room_id: &str,
-        actor_id: &str,
+        ctx: &CmdCtx,
         tracks: &[tidal::SearchResult],
         label: Option<&str>,
+        placement: QueuePlacement,
     ) -> Result<(), Error> {
         if tracks.is_empty() {
             return Ok(());
@@ -501,47 +941,64 @@ impl Bot {
                 title: first.title.clone(),
                 artist: first.artist.clone(),
                 duration: first.duration,
-                requestor: actor_id.to_owned(),
+                requestor: ctx.actor_id.clone(),
+                requestor_name: ctx.actor_display.clone(),
                 cover_url: first.cover_url.clone(),
             })
             .collect();
 
-        let pos = {
+        let position = {
             let mut rooms = self.rooms.lock().await;
-            let rs = rooms.entry(room_id.to_owned()).or_default();
-            for track in &added {
-                rs.queue.add(track.clone());
+            let rs = rooms
+                .entry(ctx.room_id.clone())
+                .or_insert_with(|| RoomState::new(&self.cfg));
+            match placement {
+                QueuePlacement::Next => {
+                    rs.queue.insert_next(added[0].clone());
+                    for track in &added[1..] {
+                        rs.queue.add(track.clone());
+                    }
+                    "next".to_owned()
+                }
+                QueuePlacement::Tail => {
+                    for track in &added {
+                        rs.queue.add(track.clone());
+                    }
+                    format!("#{}", rs.queue.total_len() - added.len() + 1)
+                }
             }
-            rs.queue.total_len()
         };
 
         let first = &added[0];
+        let where_line = if position == "next" {
+            "plays next".to_owned()
+        } else {
+            format!("position {position}")
+        };
         let body = match label {
             Some(label) => format!(
-                "{count} {label} tracks\nNext: {} · {} ({})\nPosition: #{}",
+                "{count} {label} tracks\nNext: {} · {} ({})\n↳ {where_line}",
                 first.title,
                 first.artist,
                 format_duration(first.duration),
-                pos - added.len() + 1,
                 count = added.len(),
             ),
             None => format!(
-                "{} · {} ({})\nPosition: #{}",
+                "{} · {}\n↳ {} · {where_line}",
                 first.title,
                 first.artist,
                 format_duration(first.duration),
-                pos
             ),
         };
 
-        self.send_message(room_id, &card("Added", &body)).await;
+        self.reply(ctx, &card("Added", &body)).await;
         Ok(())
     }
 
-    async fn print_queue(&self, room_id: &str) {
+    async fn print_queue(&self, ctx: &CmdCtx) {
         let message = {
             let rooms = self.rooms.lock().await;
-            let Some(rs) = rooms.get(room_id) else {
+            let Some(rs) = rooms.get(&ctx.room_id) else {
                 return;
             };
 
@@ -552,54 +1009,92 @@ impl Bot {
                 let mut body = String::new();
                 if let Some(current) = &rs.current {
                     body.push_str(&format!(
-                        "{} · {} ({})\n\n",
+                        "▶ {} · {} ({})\n",
                         current.track.title,
                         current.track.artist,
                         format_duration(current.track.duration),
                     ));
+                    if !current.track.requestor_name.is_empty() {
+                        body.push_str(&format!(
+                            "↳ requested by {}\n",
+                            current.track.requestor_name
+                        ));
+                    }
+                    if rs.queue.repeat() != RepeatMode::Off {
+                        body.push_str(&format!("↳ repeat: {}\n", rs.queue.repeat().label()));
+                    }
+                    body.push('\n');
                 }
-                for (idx, track) in list.iter().enumerate() {
+                for (idx, track) in list.iter().take(QUEUE_DISPLAY_LIMIT).enumerate() {
                     body.push_str(&format!(
-                        "{}. {} · {} ({})\n",
+                        "{}. {} · {} ({}) — {}\n",
                         idx + 1,
                         track.title,
                         track.artist,
-                        format_duration(track.duration)
+                        format_duration(track.duration),
+                        track.requestor_name
+                    ));
+                }
+                if list.len() > QUEUE_DISPLAY_LIMIT {
+                    body.push_str(&format!(
+                        "… and {} more\n",
+                        list.len() - QUEUE_DISPLAY_LIMIT
                     ));
                 }
                 card("Queue", &body)
             }
         };
 
-        self.send_message(room_id, &message).await;
+        self.reply(ctx, &message).await;
     }
 
-    async fn cmd_now_playing(&self, room_id: &str) {
+    async fn cmd_now_playing(&self, ctx: &CmdCtx) {
         let message = {
             let rooms = self.rooms.lock().await;
-            let Some(rs) = rooms.get(room_id) else {
+            let Some(rs) = rooms.get(&ctx.room_id) else {
                 return;
             };
 
             match &rs.current {
-                Some(current) => card(
-                    "Now Playing",
-                    &format!(
-                        "{} · {} ({})\n{}",
-                        current.track.title,
-                        current.track.artist,
-                        format_duration(current.track.duration),
-                        current.audio_info
-                    ),
-                ),
+                Some(current) => {
+                    let position = rs
+                        .voice
+                        .as_ref()
+                        .and_then(|v| v.play_start.load_full())
+                        .map(|started| {
+                            karaoke::format_duration_ms(started.elapsed().as_millis() as u64)
+                        })
+                        .unwrap_or_else(|| "0:00".to_owned());
+                    let request = if current.track.requestor_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n↳ requested by {}", current.track.requestor_name)
+                    };
+                    let audio = if current.audio_info.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", current.audio_info)
+                    };
+                    card(
+                        "Now Playing",
+                        &format!(
+                            "{} · {}\n{} / {}{audio}{request}",
+                            current.track.title,
+                            current.track.artist,
+                            position,
+                            format_duration(current.track.duration),
+                        ),
+                    )
+                }
                 None => card("Now Playing", "Nothing currently prepared."),
             }
         };
 
-        self.send_message(room_id, &message).await;
+        self.reply(ctx, &message).await;
     }
 
-    async fn cmd_skip(&self, room_id: &str) {
+    async fn cmd_skip(&self, ctx: &CmdCtx) {
+        let room_id = ctx.room_id.as_str();
         let (title, voice_dead) = {
             let mut rooms = self.rooms.lock().await;
             let Some(rs) = rooms.get_mut(room_id) else {
@@ -622,7 +1117,7 @@ impl Bot {
         };
 
         if voice_dead {
-            self.send_message(room_id, &card("Skipped", "Not connected to voice."))
+            self.reply(ctx, &card("Skipped", "Not connected to voice."))
                 .await;
             self.ensure_voice(room_id).await;
             return;
@@ -630,16 +1125,16 @@ impl Bot {
 
         match title {
             Some(t) => {
-                self.send_message(room_id, &card("Skipped", &t)).await;
+                self.reply(ctx, &card("Skipped", &t)).await;
             }
             None => {
-                self.send_message(room_id, &card("Skipped", "Nothing playing."))
-                    .await;
+                self.reply(ctx, &card("Skipped", "Nothing playing.")).await;
             }
         }
     }
 
-    async fn cmd_stop(&self, room_id: &str) {
+    async fn cmd_stop(&self, ctx: &CmdCtx) {
+        let room_id = ctx.room_id.as_str();
         let mut rooms = self.rooms.lock().await;
         let Some(rs) = rooms.get_mut(room_id) else {
             return;
@@ -656,48 +1151,52 @@ impl Bot {
         let count = rs.queue.len();
         rs.queue.clear();
         rs.current = None;
+        rs.pending_search.clear();
 
         let msg = card("Stopped", &format!("Removed {count} queued track(s)."));
         drop(rooms);
-        self.send_message(room_id, &msg).await;
+        self.reply(ctx, &msg).await;
     }
 
-    async fn cmd_volume(&self, room_id: &str, args: &str) {
+    async fn cmd_volume(&self, ctx: &CmdCtx, args: &str) {
+        let room_id = ctx.room_id.as_str();
+        let volume = {
+            let mut rooms = self.rooms.lock().await;
+            let rs = rooms
+                .entry(room_id.to_owned())
+                .or_insert_with(|| RoomState::new(&self.cfg));
+            rs.volume.clone()
+        };
+
         if args.trim().is_empty() {
-            let current = *self.volume.lock().await;
-            self.send_message(
-                room_id,
-                &card("Volume", &format!("Current: {:.0}%", current * 100.0)),
-            )
-            .await;
+            let current = volume.load(Ordering::SeqCst);
+            self.reply(ctx, &card("Volume", &format!("Current: {current}%")))
+                .await;
             return;
         }
 
         let Ok(pct) = args.trim().parse::<u16>() else {
-            self.send_message(room_id, &card("Volume", "Usage: volume <0-200>"))
+            self.reply(ctx, &card("Volume", "Usage: volume <0-200>"))
                 .await;
             return;
         };
 
         if pct > 200 {
-            self.send_message(room_id, &card("Volume", "Usage: volume <0-200>"))
+            self.reply(ctx, &card("Volume", "Usage: volume <0-200>"))
                 .await;
             return;
         }
 
-        let mut volume = self.volume.lock().await;
-        *volume = f64::from(pct) / 100.0;
-        self.volume_pct.store(pct as u32, Ordering::SeqCst);
-        self.send_message(room_id, &card("Volume", &format!("Set to {}%", pct)))
+        volume.store(u32::from(pct), Ordering::SeqCst);
+        self.reply(ctx, &card("Volume", &format!("Set to {}%", pct)))
             .await;
     }
 
-    async fn cmd_mute(&self, room_id: &str) {
+    async fn cmd_mute(&self, ctx: &CmdCtx) {
         let state = {
             let mut rooms = self.rooms.lock().await;
-            let Some(rs) = rooms.get_mut(room_id) else {
-                self.send_message(room_id, &card("Mute", "No active room."))
-                    .await;
+            let Some(rs) = rooms.get_mut(&ctx.room_id) else {
+                self.reply(ctx, &card("Mute", "No active room.")).await;
                 return;
             };
             let new_state = !rs.muted.load(Ordering::SeqCst);
@@ -710,7 +1209,166 @@ impl Bot {
         } else {
             card("Unmute", "Microphone unmuted.")
         };
-        self.send_message(room_id, &msg).await;
+        self.reply(ctx, &msg).await;
+    }
+
+    async fn cmd_remove(&self, ctx: &CmdCtx, args: &str) {
+        let room_id = ctx.room_id.as_str();
+        let Some(n) = parse_index(args) else {
+            self.reply(ctx, &card("Remove", "Usage: remove <n>")).await;
+            return;
+        };
+
+        let removed = {
+            let mut rooms = self.rooms.lock().await;
+            match rooms.get_mut(room_id) {
+                Some(rs) => rs.queue.remove_pending(n),
+                None => None,
+            }
+        };
+
+        match removed {
+            Some(track) => {
+                self.reply(
+                    ctx,
+                    &card("Removed", &format!("{} · {}", track.title, track.artist)),
+                )
+                .await;
+            }
+            None => {
+                self.reply(
+                    ctx,
+                    &card(
+                        "Remove",
+                        &format!("No pending track #{n}. Use `queue` to list."),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn cmd_move(&self, ctx: &CmdCtx, args: &str) {
+        let room_id = ctx.room_id.as_str();
+        let mut parts = args.split_whitespace();
+        let (Some(from), Some(to)) = (
+            parts.next().and_then(|s| s.parse::<usize>().ok()),
+            parts.next().and_then(|s| s.parse::<usize>().ok()),
+        ) else {
+            self.reply(ctx, &card("Move", "Usage: move <from> <to>"))
+                .await;
+            return;
+        };
+
+        let moved = {
+            let mut rooms = self.rooms.lock().await;
+            match rooms.get_mut(room_id) {
+                Some(rs) => rs.queue.move_pending(from, to),
+                None => false,
+            }
+        };
+
+        let msg = if moved {
+            card("Moved", &format!("#{from} -> #{to}"))
+        } else {
+            card("Move", "Both numbers must be pending queue positions.")
+        };
+        self.reply(ctx, &msg).await;
+    }
+
+    async fn cmd_shuffle(&self, ctx: &CmdCtx) {
+        let room_id = ctx.room_id.as_str();
+        let count = {
+            let mut rooms = self.rooms.lock().await;
+            let Some(rs) = rooms.get_mut(room_id) else {
+                return;
+            };
+            let count = rs.queue.list().len();
+            rs.queue.shuffle_pending();
+            count
+        };
+        self.reply(
+            ctx,
+            &card("Shuffle", &format!("Shuffled {count} pending tracks.")),
+        )
+        .await;
+    }
+
+    async fn cmd_repeat(&self, ctx: &CmdCtx, args: &str) {
+        let room_id = ctx.room_id.as_str();
+        let mode = {
+            let mut rooms = self.rooms.lock().await;
+            let rs = rooms
+                .entry(room_id.to_owned())
+                .or_insert_with(|| RoomState::new(&self.cfg));
+            let mode = match args.trim() {
+                "" => rs.queue.repeat().cycle(),
+                arg => match RepeatMode::parse(arg) {
+                    Some(mode) => mode,
+                    None => {
+                        drop(rooms);
+                        self.reply(ctx, &card("Repeat", "Usage: repeat [off|all|one]"))
+                            .await;
+                        return;
+                    }
+                },
+            };
+            rs.queue.set_repeat(mode);
+            mode
+        };
+        self.reply(ctx, &card("Repeat", &format!("Repeat: {}", mode.label())))
+            .await;
+    }
+
+    async fn cmd_stats(&self, ctx: &CmdCtx) {
+        let uptime = Utc::now().signed_duration_since(self.started_at);
+        let hours = uptime.num_hours();
+        let minutes = uptime.num_minutes() % 60;
+        let seconds = uptime.num_seconds() % 60;
+
+        let quality = {
+            let tidal = self.tidal.lock().await;
+            tidal.selected_quality().to_owned()
+        };
+
+        let mut body =
+            format!("Uptime: {hours}h {minutes:02}m {seconds:02}s\nQuality: {quality}\n");
+        {
+            let rooms = self.rooms.lock().await;
+            for room in &self.cfg.rooms {
+                let Some(rs) = rooms.get(room) else {
+                    continue;
+                };
+                let playing = rs
+                    .current
+                    .as_ref()
+                    .map(|c| format!("playing {}", c.track.title))
+                    .unwrap_or_else(|| "idle".to_owned());
+                let lyrics = if rs.lyrics_enabled { "on" } else { "off" };
+                let volume = rs.volume.load(Ordering::SeqCst);
+                body.push_str(&format!(
+                    "Room {room}: {playing}, queue {}, lyrics {lyrics}, vol {volume}%\n",
+                    rs.queue.len()
+                ));
+            }
+        }
+        self.reply(ctx, &card("Stats", body.trim_end())).await;
+    }
+
+    async fn cmd_help(&self, ctx: &CmdCtx, args: &str) {
+        let topic = args.split_whitespace().next();
+        let message = match topic.map(|t| parse_command(t, "")) {
+            Some(Some(parsed)) => card("Help", command_help(parsed.command)),
+            Some(None) => card(
+                "Help",
+                &format!(
+                    "No such command: {}\nType help for the list.",
+                    topic.unwrap_or_default()
+                ),
+            ),
+            None => help_message(),
+        };
+        self.reply(ctx, &message).await;
     }
 
     async fn auto_prepare_playback(&self) {
@@ -790,7 +1448,7 @@ impl Bot {
     }
 
     async fn ensure_voice(&self, room_id: &str) {
-        let (stream_url, muted) = {
+        let (stream_url, muted, volume) = {
             let rooms = self.rooms.lock().await;
             let Some(rs) = rooms.get(room_id) else {
                 return;
@@ -801,7 +1459,11 @@ impl Bot {
             if rs.voice.as_ref().is_some_and(|v| !v.handle.is_finished()) {
                 return;
             }
-            (current.stream_url.clone(), Arc::clone(&rs.muted))
+            (
+                current.stream_url.clone(),
+                Arc::clone(&rs.muted),
+                Arc::clone(&rs.volume),
+            )
         };
 
         let room_id_owned = room_id.to_owned();
@@ -812,8 +1474,10 @@ impl Bot {
         let song_cancel = Arc::new(AtomicBool::new(false));
         let next_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some(stream_url)));
 
-        let video_source: Arc<Mutex<Option<NativeVideoSource>>> = Arc::new(Mutex::new(None));
-        let vs_task = video_source.clone();
+        let video: Arc<Mutex<Option<VideoTrack>>> = Arc::new(Mutex::new(None));
+        let vs_task = video.clone();
+        let video_unpublish = Arc::new(AtomicBool::new(false));
+        let unpub_task = video_unpublish.clone();
         let play_start: Arc<ArcSwapOption<Instant>> = Arc::new(ArcSwapOption::empty());
         let ps_task = play_start.clone();
 
@@ -821,8 +1485,9 @@ impl Bot {
         let sc = Arc::clone(&song_cancel);
         let nu = Arc::clone(&next_url);
         let mu = Arc::clone(&muted);
-        let vp = Arc::clone(&self.volume_pct);
+        let vp = volume;
         let db = Arc::clone(&self.rooms);
+        let tidal = Arc::clone(&self.tidal);
         let rid = room_id_owned.clone();
         let ch = chatto.clone();
 
@@ -831,21 +1496,13 @@ impl Bot {
                 Ok(j) => j,
                 Err(e) => {
                     warn!(room = rid, error = %e, "join call failed");
-                    let mut rooms = db.lock().await;
-                    if let Some(rs) = rooms.get_mut(&rid) {
-                        rs.current = None;
-                        rs.voice = None;
-                    }
+                    mark_voice_dead(&db, &rid).await;
                     return;
                 }
             };
             if !joined {
                 warn!(room = rid, "voice channel required");
-                let mut rooms = db.lock().await;
-                if let Some(rs) = rooms.get_mut(&rid) {
-                    rs.current = None;
-                    rs.voice = None;
-                }
+                mark_voice_dead(&db, &rid).await;
                 return;
             }
 
@@ -853,11 +1510,8 @@ impl Bot {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(room = rid, error = %e, "get call token failed");
-                    let mut rooms = db.lock().await;
-                    if let Some(rs) = rooms.get_mut(&rid) {
-                        rs.current = None;
-                        rs.voice = None;
-                    }
+                    mark_voice_dead(&db, &rid).await;
+                    let _ = ch.leave_call(&rid).await;
                     return;
                 }
             };
@@ -873,11 +1527,8 @@ impl Bot {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(room = rid, error = %e, "livekit init failed");
-                    let mut rooms = db.lock().await;
-                    if let Some(rs) = rooms.get_mut(&rid) {
-                        rs.current = None;
-                        rs.voice = None;
-                    }
+                    mark_voice_dead(&db, &rid).await;
+                    let _ = ch.leave_call(&rid).await;
                     return;
                 }
             };
@@ -887,31 +1538,18 @@ impl Bot {
                 Err(e) => {
                     warn!(room = rid, error = %e, "publish track failed");
                     player.disconnect().await;
-                    let mut rooms = db.lock().await;
-                    if let Some(rs) = rooms.get_mut(&rid) {
-                        rs.current = None;
-                        rs.voice = None;
-                    }
+                    mark_voice_dead(&db, &rid).await;
+                    let _ = ch.leave_call(&rid).await;
                     return;
                 }
             };
 
-            // Publish video track if lyrics is currently enabled
-            {
+            // Screenshare up front if lyrics is already on.
+            let lyrics_enabled = {
                 let rooms = db.lock().await;
-                let lyrics_enabled = rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled);
-                if lyrics_enabled
-                    && let Ok((src, _)) = livekit_video::publish_video_track(
-                        player.room(),
-                        "screenshare",
-                        livekit_video::DEFAULT_WIDTH,
-                        livekit_video::DEFAULT_HEIGHT,
-                    )
-                    .await
-                {
-                    *vs_task.lock().await = Some(src);
-                }
-            }
+                rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled)
+            };
+            sync_video_track(player.room(), &vs_task, &unpub_task, lyrics_enabled).await;
 
             info!(room = rid, "voice connected");
 
@@ -922,63 +1560,144 @@ impl Bot {
                     break;
                 }
 
-                // If lyrics was enabled after connect, publish video track now
-                if vs_task.lock().await.is_none() {
-                    let rooms = db.lock().await;
-                    if rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled) {
-                        drop(rooms);
-                        if let Ok((src, _)) = livekit_video::publish_video_track(
-                            player.room(),
-                            "screenshare",
-                            livekit_video::DEFAULT_WIDTH,
-                            livekit_video::DEFAULT_HEIGHT,
-                        )
-                        .await
-                        {
-                            *vs_task.lock().await = Some(src);
-                        }
-                    }
+                // Catch `/lyrics` toggles that happened between tracks.
+                {
+                    let lyrics_enabled = {
+                        let rooms = db.lock().await;
+                        rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled)
+                    };
+                    sync_video_track(player.room(), &vs_task, &unpub_task, lyrics_enabled).await;
                 }
 
                 let url = nu.lock().await.take();
 
                 match url {
-                    Some(u) => {
+                    Some(url) => {
                         sc.store(false, Ordering::SeqCst);
-                        ps_task.store(Some(Arc::new(Instant::now())));
 
-                        // Playback blocks here for the whole track, so poll
-                        // for a mid-song `/lyrics` while it runs: the video
-                        // track is published as soon as lyrics turn on.
-                        let mut play = std::pin::pin!(LivekitPlayer::play_url_on_source(
-                            &source,
-                            &u,
-                            sample_rate_p,
-                            &vp,
-                            &sc,
-                            &mu,
-                        ));
-                        let result = loop {
-                            if vs_task.lock().await.is_none() {
-                                let lyrics_enabled = {
-                                    let rooms = db.lock().await;
-                                    rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled)
-                                };
-                                if lyrics_enabled
-                                    && let Ok((src, _)) = livekit_video::publish_video_track(
-                                        player.room(),
-                                        "screenshare",
-                                        livekit_video::DEFAULT_WIDTH,
-                                        livekit_video::DEFAULT_HEIGHT,
+                        // Announce the track and who requested it.
+                        let announce = {
+                            let rooms = db.lock().await;
+                            rooms
+                                .get(&rid)
+                                .and_then(|rs| rs.current.as_ref())
+                                .map(|cur| {
+                                    let who = if cur.track.requestor_name.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("\n↳ requested by {}", cur.track.requestor_name)
+                                    };
+                                    let audio = if cur.audio_info.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" · {}", cur.audio_info)
+                                    };
+                                    card(
+                                        "Now Playing",
+                                        &format!(
+                                            "{} · {}\n{}{audio}{who}",
+                                            cur.track.title,
+                                            cur.track.artist,
+                                            format_duration(cur.track.duration),
+                                        ),
                                     )
-                                    .await
-                                {
-                                    *vs_task.lock().await = Some(src);
+                                })
+                        };
+                        if let Some(msg) = announce
+                            && let Err(e) = ch.create_message(&rid, &msg).await
+                        {
+                            warn!(room = rid, error = %e, "now playing announcement failed");
+                        }
+
+                        // Tidal URLs expire: re-resolve once on failure.
+                        let mut attempt = 0u8;
+                        let mut url = url;
+                        let result = loop {
+                            ps_task.store(Some(Arc::new(Instant::now())));
+
+                            // Poll `/lyrics` while the track plays. The block
+                            // also ends the url borrow before a retry can
+                            // reassign it.
+                            let res = {
+                                let mut play = std::pin::pin!(LivekitPlayer::play_url_on_source(
+                                    &source,
+                                    &url,
+                                    sample_rate_p,
+                                    &vp,
+                                    &sc,
+                                    &mu,
+                                ));
+                                loop {
+                                    {
+                                        let lyrics_enabled = {
+                                            let rooms = db.lock().await;
+                                            rooms.get(&rid).is_some_and(|rs| rs.lyrics_enabled)
+                                        };
+                                        sync_video_track(
+                                            player.room(),
+                                            &vs_task,
+                                            &unpub_task,
+                                            lyrics_enabled,
+                                        )
+                                        .await;
+                                    }
+                                    tokio::select! {
+                                        r = play.as_mut() => break r,
+                                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                                    }
                                 }
-                            }
-                            tokio::select! {
-                                r = play.as_mut() => break r,
-                                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            };
+
+                            match res {
+                                Ok(()) => {
+                                    // A natural finish honours the repeat mode.
+                                    let mut rooms = db.lock().await;
+                                    if let Some(rs) = rooms.get_mut(&rid)
+                                        && let Some(cur) = &rs.current
+                                    {
+                                        rs.queue.on_track_ended(&cur.track);
+                                    }
+                                    break Ok(());
+                                }
+                                Err(livekit_audio::Error::Cancelled) => {
+                                    break Err(livekit_audio::Error::Cancelled);
+                                }
+                                Err(e) => {
+                                    if attempt > 0 || sc.load(Ordering::SeqCst) {
+                                        break Err(e);
+                                    }
+                                    attempt = 1;
+                                    warn!(
+                                        room = rid,
+                                        error = %e,
+                                        "playback failed, re-resolving stream url"
+                                    );
+                                    let tid = {
+                                        let rooms = db.lock().await;
+                                        rooms
+                                            .get(&rid)
+                                            .and_then(|rs| rs.current.as_ref())
+                                            .map(|c| c.track.tid)
+                                    };
+                                    let fresh = match tid {
+                                        Some(tid) => {
+                                            let client = tidal.lock().await;
+                                            client.stream_track(tid).await.map(|s| s.stream_url)
+                                        }
+                                        None => break Err(e),
+                                    };
+                                    match fresh {
+                                        Ok(fresh) => url = fresh,
+                                        Err(e2) => {
+                                            error!(
+                                                room = rid,
+                                                error = %e2,
+                                                "stream re-resolve failed"
+                                            );
+                                            break Err(e);
+                                        }
+                                    }
+                                }
                             }
                         };
 
@@ -994,11 +1713,15 @@ impl Bot {
                         }
                         drop(rooms);
 
-                        match result {
-                            Ok(()) => {}
-                            Err(livekit_audio::Error::Cancelled) => {}
-                            Err(e) => {
-                                error!(room = rid, error = %e, "playback error");
+                        if let Err(e) = result
+                            && !matches!(e, livekit_audio::Error::Cancelled)
+                        {
+                            error!(room = rid, error = %e, "playback error");
+                            if let Err(err) = ch
+                                .create_message(&rid, &card("Playback Error", &e.to_string()))
+                                .await
+                            {
+                                warn!(room = rid, error = %err, "failed to report playback error");
                             }
                         }
                     }
@@ -1012,6 +1735,9 @@ impl Bot {
             }
 
             player.disconnect().await;
+            if let Err(e) = ch.leave_call(&rid).await {
+                warn!(room = rid, error = %e, "leave call failed");
+            }
             info!(room = rid, "voice disconnected");
         });
 
@@ -1023,7 +1749,8 @@ impl Bot {
                     cancel: voice_cancel,
                     song_cancel,
                     next_url,
-                    video_source,
+                    video,
+                    video_unpublish,
                     play_start,
                 });
             }
@@ -1059,15 +1786,52 @@ impl Bot {
         }
     }
 
-    async fn cmd_test(&self, room_id: &str) {
-        self.send_message(room_id, &card("Test", "Publishing 10s of silence..."))
+    /// Send a command response to its thread; room timeline if thread
+    /// replies are off or the post fails (e.g. missing
+    /// `message.post-in-thread`).
+    async fn reply(&self, ctx: &CmdCtx, text: &str) {
+        if let Some(root) = &ctx.reply.thread_root {
+            match self
+                .chatto
+                .create_thread_reply(&ctx.room_id, text, root, ctx.reply.source_event.as_deref())
+                .await
+            {
+                Ok(()) => return,
+                Err(err) => warn!(
+                    room = ctx.room_id,
+                    error = %err,
+                    "thread reply failed, posting to the room timeline instead"
+                ),
+            }
+        }
+        self.send_message(&ctx.room_id, text).await;
+    }
+
+    /// Track a thread for polling; follow it on the server the first time.
+    async fn watch_thread(&self, room_id: &str, root: &str) {
+        let newly = {
+            let mut rooms = self.rooms.lock().await;
+            match rooms.get_mut(room_id) {
+                Some(rs) => rs.threads.watch(root),
+                None => false,
+            }
+        };
+        if newly && let Err(err) = self.chatto.follow_thread(room_id, root).await {
+            // The follow only feeds notifications; polling works without it.
+            warn!(room = room_id, thread = root, error = %err, "follow thread failed");
+        }
+    }
+
+    async fn cmd_test(&self, ctx: &CmdCtx) {
+        let room_id = ctx.room_id.as_str();
+        self.reply(ctx, &card("Test", "Publishing 10s of silence..."))
             .await;
 
         let token = match self.chatto.create_call_token(room_id).await {
             Ok(token) => token,
             Err(err) => {
-                self.send_message(
-                    room_id,
+                self.reply(
+                    ctx,
                     &card("Test Error", &format!("Create call token: {err}")),
                 )
                 .await;
@@ -1085,22 +1849,19 @@ impl Bot {
         {
             Ok(player) => player,
             Err(err) => {
-                self.send_message(
-                    room_id,
-                    &card("Test Error", &format!("Create player: {err}")),
-                )
-                .await;
+                self.reply(ctx, &card("Test Error", &format!("Create player: {err}")))
+                    .await;
                 return;
             }
         };
 
         match player.play_silence_only(Duration::from_secs(10)).await {
             Ok(()) => {
-                self.send_message(room_id, &card("Test", "10s silence published OK."))
+                self.reply(ctx, &card("Test", "10s silence published OK."))
                     .await;
             }
             Err(err) => {
-                self.send_message(room_id, &card("Test Failed", &err.to_string()))
+                self.reply(ctx, &card("Test Failed", &err.to_string()))
                     .await;
             }
         }
@@ -1108,27 +1869,33 @@ impl Bot {
         player.disconnect().await;
     }
 
-    async fn cmd_lyrics(&self, room_id: &str) {
+    async fn cmd_lyrics(&self, ctx: &CmdCtx) {
+        let room_id = ctx.room_id.as_str();
         let enable = {
             let mut rooms = self.rooms.lock().await;
             let Some(rs) = rooms.get_mut(room_id) else {
                 return;
             };
             rs.lyrics_enabled = !rs.lyrics_enabled;
-            if !rs.lyrics_enabled
-                && let Some(cancel) = rs.karaoke_cancel.take()
-            {
-                cancel.store(true, Ordering::SeqCst);
+            if !rs.lyrics_enabled {
+                if let Some(cancel) = rs.karaoke_cancel.take() {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                // Only the voice task has the Room; ask it to unpublish so
+                // the last frame does not linger.
+                if let Some(ref v) = rs.voice {
+                    v.video_unpublish.store(true, Ordering::SeqCst);
+                }
             }
             rs.lyrics_enabled
         };
 
         if enable {
-            self.send_message(room_id, &card("Lyrics", "Karaoke screenshare enabled."))
+            self.reply(ctx, &card("Lyrics", "Karaoke screenshare enabled."))
                 .await;
             self.start_karaoke(room_id).await;
         } else {
-            self.send_message(room_id, &card("Lyrics", "Karaoke screenshare disabled."))
+            self.reply(ctx, &card("Lyrics", "Karaoke screenshare disabled."))
                 .await;
         }
     }
@@ -1212,9 +1979,9 @@ impl Bot {
                 if let Some(rs) = r.get(&rid)
                     && let Some(ref v) = rs.voice
                 {
-                    let guard = v.video_source.lock().await;
-                    if let Some(ref src) = *guard {
-                        break (src.clone(), v.play_start.clone());
+                    let guard = v.video.lock().await;
+                    if let Some(ref vt) = *guard {
+                        break (vt.source.clone(), v.play_start.clone());
                     }
                 }
                 drop(r);
@@ -1244,6 +2011,47 @@ impl Bot {
 
             tracing::info!(room = rid, "karaoke screenshare ended");
         });
+    }
+}
+
+/// Clear playback state after a voice task gives up, so `auto_prepare` can
+/// rebuild a fresh connection.
+async fn mark_voice_dead(db: &Arc<Mutex<HashMap<String, RoomState>>>, rid: &str) {
+    let mut rooms = db.lock().await;
+    if let Some(rs) = rooms.get_mut(rid) {
+        rs.current = None;
+        rs.voice = None;
+    }
+}
+
+/// Publish/unpublish the screenshare to match the `/lyrics` toggle. Only the
+/// voice task owns the `Room`, so unpublishing has to happen here.
+async fn sync_video_track(
+    room: &LivekitRoom,
+    video: &Arc<Mutex<Option<VideoTrack>>>,
+    unpublish: &AtomicBool,
+    lyrics_enabled: bool,
+) {
+    if unpublish.swap(false, Ordering::SeqCst) {
+        let taken = video.lock().await.take();
+        if let Some(vt) = taken {
+            let _ = room
+                .local_participant()
+                .unpublish_track(&vt.track.sid())
+                .await;
+        }
+    }
+    if lyrics_enabled
+        && video.lock().await.is_none()
+        && let Ok((source, track)) = livekit_video::publish_video_track(
+            room,
+            "screenshare",
+            livekit_video::DEFAULT_WIDTH,
+            livekit_video::DEFAULT_HEIGHT,
+        )
+        .await
+    {
+        *video.lock().await = Some(VideoTrack { source, track });
     }
 }
 
@@ -1296,32 +2104,33 @@ fn parse_event_time(s: &str) -> Option<DateTime<Utc>> {
     Some(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
+/// Discord-style embed: a left bar, capitalized title, one `┃ ` line per
+/// body line. No right border, so it survives proportional fonts and wrap.
 fn card(title: &str, body: &str) -> String {
-    const WIDTH: usize = 52;
+    let upper = title.to_ascii_uppercase();
 
-    let mut out = String::with_capacity(WIDTH * (body.lines().count() + 3));
-
-    let title_len = title.chars().count();
-    let dashes = WIDTH.saturating_sub(title_len + 5);
-    out.push_str("┌─ ");
-    out.push_str(title);
-    out.push(' ');
-    for _ in 0..dashes {
-        out.push('─');
-    }
-    out.push_str("┐\n");
-
-    for line in body.lines() {
-        out.push_str("│  ");
-        out.push_str(line);
+    let mut out = String::with_capacity(32 * (body.lines().count() + 2));
+    if upper.is_empty() {
+        out.push_str("┃\n");
+    } else {
+        out.push_str("┃ ");
+        out.push_str(&upper);
         out.push('\n');
     }
 
-    out.push('└');
-    for _ in 0..(WIDTH - 2) {
-        out.push('─');
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            out.push_str("┃\n");
+        } else {
+            out.push_str("┃ ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
-    out.push('┘');
+
+    while out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 
@@ -1334,7 +2143,18 @@ fn format_duration(seconds: i32) -> String {
 fn help_message() -> String {
     card(
         "Commands",
-        "Use /chatto-tidal <command> or mention me\nplay <track | tidal link>\nqueue <track | tidal link>\nqueue\nskip\nstop\nnowplaying\nvolume <0-200>\nmute / unmute\nlyrics\ntest\nversion\nhelp",
+        "Use /chatto-tidal <command> or mention me\n\n\
+         • play <track | link> — best match or pick\n\
+         • queue — list pending tracks\n\
+         • pick <n> — choose from the last search\n\
+         • playnext <track | link> — after the current song\n\
+         • skip  • stop  • nowplaying\n\
+         • remove <n>  • move <a> <b>  • shuffle\n\
+         • repeat [off|all|one]\n\
+         • volume [0-200]  • mute\n\
+         • lyrics — karaoke screenshare\n\
+         • stats  • test  • version\n\
+         • help <command> — details for one",
     )
 }
 
@@ -1353,50 +2173,49 @@ mod tests {
     }
 
     #[test]
-    fn card_frames_title_and_body() {
-        let out = card("T", "line1\nline2");
+    fn card_renders_embed_style() {
+        let out = card("Some Title", "line1\nline2");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4, "header + 2 body + footer, got {out:?}");
+        assert_eq!(lines.len(), 3, "header + 2 body, got {out:?}");
 
-        assert!(lines[0].starts_with("┌─ T "), "header: {:?}", lines[0]);
-        assert!(lines[0].ends_with('┐'));
-        assert_eq!(lines[0].chars().count(), 52);
-
-        assert!(lines[1].starts_with("│  line1"));
-        assert!(lines[2].starts_with("│  line2"));
-
-        assert!(lines[3].starts_with("└─"));
-        assert!(lines[3].ends_with('┘'));
-        assert_eq!(lines[3].chars().count(), 52);
-        assert!(out.ends_with('┘'), "no trailing newline expected");
+        assert!(lines[0].starts_with("┃ "), "header: {:?}", lines[0]);
+        assert!(lines[0].ends_with("SOME TITLE"));
+        assert_eq!(lines[1], "┃ line1");
+        assert_eq!(lines[2], "┃ line2");
+        assert!(!out.ends_with('\n'), "no trailing newline expected");
     }
 
     #[test]
-    fn card_with_empty_body_only_borders() {
+    fn card_with_empty_body_is_just_the_header() {
         let out = card("Empty", "");
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("┌─ Empty "));
-        assert!(lines[1].starts_with('└'));
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.ends_with("EMPTY"));
     }
 
     #[test]
-    fn card_with_empty_title() {
+    fn card_with_empty_title_shows_bare_bar() {
         let out = card("", "x");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0].chars().count(), 52);
-        assert!(lines[0].starts_with("┌─  "));
+        assert_eq!(lines[0], "┃");
+        assert_eq!(lines[1], "┃ x");
     }
 
     #[test]
-    fn card_with_long_title_overflows_without_panicking() {
-        let long_title = "a very very very very very very long title indeed"; // 49 chars
-        let out = card(long_title, "body");
-        let header = out.lines().next().unwrap();
-        assert!(header.contains(long_title));
-        assert!(header.ends_with('┐'));
-        // No room for filler dashes: header is just the title plus 5 borders.
-        assert_eq!(header.chars().count(), long_title.chars().count() + 5);
+    fn card_blank_lines_keep_the_bar_and_long_titles_pass_through() {
+        let out = card("Q", "a\n\nb");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "┃ a");
+        assert_eq!(lines[2], "┃");
+        assert_eq!(lines[3], "┃ b");
+
+        let long = "a very very very very very very long title indeed";
+        let out = card(long, "body");
+        assert!(
+            out.lines()
+                .next()
+                .unwrap()
+                .contains(&long.to_ascii_uppercase())
+        );
     }
 
     #[test]
@@ -1464,18 +2283,123 @@ mod tests {
     #[test]
     fn help_message_lists_commands_in_a_card() {
         let msg = help_message();
-        assert!(msg.starts_with("┌─ Commands "), "got: {msg}");
+        assert!(msg.starts_with("┃ COMMANDS"), "got: {msg}");
         for needle in [
-            "play <track | tidal link>",
-            "queue <track | tidal link>",
-            "nowplaying",
-            "volume <0-200>",
-            "mute / unmute",
+            "• play <track | link>",
+            "• pick <n>",
+            "• playnext <track | link>",
+            "• remove <n>",
+            "repeat [off|all|one]",
+            "volume [0-200]",
             "lyrics",
-            "version",
-            "help",
+            "stats",
+            "help <command>",
         ] {
             assert!(msg.contains(needle), "missing {needle:?} in help");
         }
+    }
+
+    #[test]
+    fn recent_events_dedups_within_cap_and_evicts_oldest() {
+        let mut recent = RecentEvents {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        };
+        assert!(!recent.mark_seen("a".into()));
+        assert!(recent.mark_seen("a".into()));
+        assert!(!recent.mark_seen("b".into()));
+        assert_eq!(recent.seen.len(), 2);
+
+        // Fill past the cap: old ids drop out and become reusable.
+        for i in 0..SEEN_EVENTS_CAP + 10 {
+            recent.mark_seen(format!("id-{i}"));
+        }
+        assert!(recent.seen.len() <= SEEN_EVENTS_CAP);
+        assert!(recent.order.len() <= SEEN_EVENTS_CAP);
+        assert!(!recent.mark_seen("a".into())); // long evicted
+    }
+
+    #[test]
+    fn reply_ctx_threads_root_level_messages() {
+        let rc = reply_ctx("evt_1", "");
+        assert_eq!(rc.thread_root.as_deref(), Some("evt_1"));
+        assert_eq!(rc.source_event.as_deref(), Some("evt_1"));
+    }
+
+    #[test]
+    fn reply_ctx_reuses_existing_thread_root() {
+        let rc = reply_ctx("evt_reply", "evt_root");
+        assert_eq!(rc.thread_root.as_deref(), Some("evt_root"));
+        assert_eq!(rc.source_event.as_deref(), Some("evt_reply"));
+    }
+
+    #[test]
+    fn reply_ctx_without_ids_falls_back_to_room() {
+        let rc = reply_ctx("", "");
+        assert!(rc.thread_root.is_none());
+        assert!(rc.source_event.is_none());
+    }
+
+    #[test]
+    fn thread_watch_is_idempotent_and_reports_newness() {
+        let mut watch = ThreadWatch::default();
+        assert!(watch.watch("t1"));
+        assert!(!watch.watch("t1"));
+        assert_eq!(watch.snapshot(), vec![("t1".to_owned(), String::new())]);
+    }
+
+    #[test]
+    fn thread_watch_advances_cursor_and_snapshots_order() {
+        let mut watch = ThreadWatch::default();
+        watch.watch("t1");
+        watch.watch("t2");
+        watch.advance("t1", "c1".to_owned());
+        // Empty cursors (page without one yet) must not reset progress.
+        watch.advance("t2", String::new());
+
+        let snap = watch.snapshot();
+        assert_eq!(snap[0], ("t1".to_owned(), "c1".to_owned()));
+        assert_eq!(snap[1], ("t2".to_owned(), String::new()));
+    }
+
+    #[test]
+    fn thread_watch_evicts_oldest_past_cap() {
+        let mut watch = ThreadWatch::default();
+        for i in 0..MAX_WATCHED_THREADS + 5 {
+            watch.watch(&format!("t{i}"));
+        }
+        assert_eq!(watch.cursors.len(), MAX_WATCHED_THREADS);
+        assert_eq!(watch.order.len(), MAX_WATCHED_THREADS);
+        // The first five are gone; the last registered stays.
+        assert!(!watch.cursors.contains_key("t0"));
+        assert!(
+            watch
+                .cursors
+                .contains_key(&format!("t{}", MAX_WATCHED_THREADS + 4))
+        );
+    }
+
+    #[test]
+    fn thread_watch_unwatch_drops_cursor_and_order() {
+        let mut watch = ThreadWatch::default();
+        watch.watch("t1");
+        watch.watch("t2");
+        watch.advance("t1", "c1".to_owned());
+        watch.unwatch("t1");
+        assert_eq!(watch.snapshot().len(), 1);
+        assert!(watch.snapshot()[0].0 == "t2");
+        // Re-watching starts from scratch again.
+        assert!(watch.watch("t1"));
+        assert_eq!(watch.snapshot()[1], ("t1".to_owned(), String::new()));
+    }
+
+    #[test]
+    fn parse_index_requires_positive_first_token() {
+        assert_eq!(parse_index("3"), Some(3));
+        assert_eq!(parse_index(" 2 more words "), Some(2));
+        assert_eq!(parse_index("0"), None);
+        assert_eq!(parse_index("-1"), None);
+        assert_eq!(parse_index("abc"), None);
+        assert_eq!(parse_index(""), None);
     }
 }

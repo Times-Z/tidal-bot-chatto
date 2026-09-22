@@ -2,14 +2,21 @@
 pub enum Command {
     Play,
     Queue,
+    Pick,
     Skip,
     Stop,
     NowPlaying,
     Volume,
     Mute,
+    Remove,
+    Move,
+    PlayNext,
+    Shuffle,
+    Repeat,
+    Lyrics,
+    Stats,
     Test,
     Help,
-    Lyrics,
     Version,
 }
 
@@ -63,21 +70,56 @@ pub fn parse_command(body: &str, bot_name: &str) -> Option<ParsedCommand> {
     let args = parts.next().map(str::trim).unwrap_or_default().to_owned();
 
     let command = match raw_command.as_str() {
-        "play" => Command::Play,
-        "queue" => Command::Queue,
+        "play" | "p" => Command::Play,
+        "queue" | "q" => Command::Queue,
+        "pick" => Command::Pick,
         "skip" => Command::Skip,
         "stop" => Command::Stop,
-        "nowplaying" => Command::NowPlaying,
-        "volume" => Command::Volume,
+        "nowplaying" | "np" => Command::NowPlaying,
+        "volume" | "vol" => Command::Volume,
         "mute" | "unmute" => Command::Mute,
+        "remove" | "rm" => Command::Remove,
+        "move" => Command::Move,
+        "playnext" | "next" => Command::PlayNext,
+        "shuffle" => Command::Shuffle,
+        "repeat" => Command::Repeat,
+        "lyrics" => Command::Lyrics,
+        "stats" => Command::Stats,
         "test" => Command::Test,
         "help" => Command::Help,
-        "lyrics" => Command::Lyrics,
         "version" => Command::Version,
         _ => return None,
     };
 
     Some(ParsedCommand { command, args })
+}
+
+/// One-line usage shown by `/chatto-tidal help <command>`.
+pub fn command_help(command: Command) -> &'static str {
+    match command {
+        Command::Play => {
+            "play <track | tidal link> — search and queue the best match; several results asks for pick"
+        }
+        Command::Queue => "queue — list what is queued; queue <track | link> is an alias for play",
+        Command::Pick => "pick <n> — choose result n from the last search",
+        Command::Skip => "skip — end the current track and play the next one",
+        Command::Stop => "stop — stop playback, clear the queue and disable repeat",
+        Command::NowPlaying => "nowplaying — current track with position, duration and requestor",
+        Command::Volume => "volume [0-200] — show or set this room's playback volume",
+        Command::Mute => "mute / unmute — pause sending audio without losing position",
+        Command::Remove => "remove <n> — drop pending track n from the queue",
+        Command::Move => "move <from> <to> — reorder pending tracks",
+        Command::PlayNext => {
+            "playnext <track | tidal link> — insert the track right after the current one"
+        }
+        Command::Shuffle => "shuffle — randomize the pending queue",
+        Command::Repeat => "repeat [off|all|one] — show or set repeat mode",
+        Command::Lyrics => "lyrics — toggle the karaoke screenshare",
+        Command::Stats => "stats — uptime, rooms, queues and Tidal quality",
+        Command::Test => "test — publish 10s of silence (diagnostic)",
+        Command::Help => "help [command] — this list, or details for one command",
+        Command::Version => "version — bot version",
+    }
 }
 
 fn strip_mention<'a>(body: &'a str, bot_name: &str) -> (&'a str, bool) {
@@ -238,22 +280,64 @@ mod tests {
     fn parse_all_command_variants() {
         let cases = [
             ("play x", Command::Play),
+            ("p x", Command::Play),
             ("queue y", Command::Queue),
+            ("q", Command::Queue),
+            ("pick 2", Command::Pick),
             ("skip", Command::Skip),
             ("stop", Command::Stop),
             ("nowplaying", Command::NowPlaying),
+            ("np", Command::NowPlaying),
             ("volume 80", Command::Volume),
+            ("vol 80", Command::Volume),
             ("mute", Command::Mute),
             ("unmute", Command::Mute),
+            ("remove 3", Command::Remove),
+            ("rm 3", Command::Remove),
+            ("move 4 1", Command::Move),
+            ("playnext x", Command::PlayNext),
+            ("next x", Command::PlayNext),
+            ("shuffle", Command::Shuffle),
+            ("repeat one", Command::Repeat),
+            ("lyrics", Command::Lyrics),
+            ("stats", Command::Stats),
             ("test", Command::Test),
             ("help", Command::Help),
-            ("lyrics", Command::Lyrics),
             ("version", Command::Version),
         ];
         for (body, expected) in cases {
             let cmd = parse_command(body, "tidal_bot")
                 .unwrap_or_else(|| panic!("failed to parse {body:?}"));
             assert_eq!(cmd.command, expected, "for {body:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_has_help_text() {
+        let all = [
+            Command::Play,
+            Command::Queue,
+            Command::Pick,
+            Command::Skip,
+            Command::Stop,
+            Command::NowPlaying,
+            Command::Volume,
+            Command::Mute,
+            Command::Remove,
+            Command::Move,
+            Command::PlayNext,
+            Command::Shuffle,
+            Command::Repeat,
+            Command::Lyrics,
+            Command::Stats,
+            Command::Test,
+            Command::Help,
+            Command::Version,
+        ];
+        for cmd in all {
+            let text = command_help(cmd);
+            assert!(!text.is_empty(), "missing help for {cmd:?}");
+            assert!(text.contains(' '), "help for {cmd:?} should be a sentence");
         }
     }
 

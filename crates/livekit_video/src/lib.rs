@@ -2,13 +2,14 @@
 
 use libwebrtc::prelude::*;
 use livekit::options::TrackPublishOptions;
-use livekit::prelude::{LocalTrack, LocalVideoTrack, Room, TrackSource};
+use livekit::prelude::{LocalTrack, TrackSource};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use libwebrtc::prelude::{I420Buffer, VideoFrame, VideoResolution, VideoRotation};
 pub use libwebrtc::video_source::native::NativeVideoSource;
+pub use livekit::prelude::{LocalVideoTrack, Room};
 
 pub const DEFAULT_WIDTH: u32 = 1920;
 pub const DEFAULT_HEIGHT: u32 = 1080;

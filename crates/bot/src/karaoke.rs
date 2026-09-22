@@ -235,18 +235,44 @@ impl KaraokeRenderer {
                 );
             }
 
-            // Current line (large)
+            // Current line with a word sweep: per-word timing does not come
+            // from Tidal/LRCLib, so interpolate across the line gap.
             if current_idx < lyrics.len() {
                 let curr = &lyrics[current_idx];
-                draw_text_centered(
+                let line_end = lyrics
+                    .get(current_idx + 1)
+                    .map(|l| l.timestamp_ms)
+                    .unwrap_or_else(|| curr.timestamp_ms + 5_000);
+                let line_dur = line_end.saturating_sub(curr.timestamp_ms).max(1) as f32;
+                let into_line = elapsed_ms.saturating_sub(curr.timestamp_ms) as f32;
+                let progress = (into_line / line_dur).clamp(0.0, 1.0);
+                let fade = (into_line / 300.0).clamp(0.0, 1.0);
+
+                let scale = PxScale::from(44.0);
+                let full_w = text_width(&self.font_bold, scale, &curr.text);
+                let left_x = w / 2.0 - full_w / 2.0;
+
+                draw_text_left(
                     &mut frame,
                     &self.font_bold,
                     &curr.text,
-                    PxScale::from(44.0),
-                    Rgba([255, 255, 255, 255]),
-                    w / 2.0,
+                    scale,
+                    Rgba([200, 200, 200, (150.0 * fade) as u8]),
+                    left_x,
                     mid,
                 );
+                let sung = sung_prefix(&curr.text, progress);
+                if !sung.is_empty() {
+                    draw_text_left(
+                        &mut frame,
+                        &self.font_bold,
+                        sung,
+                        scale,
+                        Rgba([255, 255, 255, (255.0 * fade) as u8]),
+                        left_x,
+                        mid,
+                    );
+                }
             }
 
             // Next line
@@ -291,6 +317,40 @@ fn find_current_line(lyrics: &[LyricLine], elapsed_ms: u64) -> usize {
     idx
 }
 
+/// Bytes of `text` sung at `progress` (0.0..=1.0), snapped to word
+/// boundaries (ASCII whitespace).
+fn sung_prefix(text: &str, progress: f32) -> &str {
+    let bytes = text.as_bytes();
+    let mut ends: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        ends.push(i);
+    }
+    if ends.is_empty() {
+        return text;
+    }
+    let sung = (progress.clamp(0.0, 1.0) * ends.len() as f32).round() as usize;
+    if sung == 0 {
+        &text[..0]
+    } else {
+        &text[..ends[sung - 1]]
+    }
+}
+
+fn text_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {
+    let scaled = font.as_scaled(scale);
+    text.chars()
+        .map(|c| scaled.h_advance(font.glyph_id(c)))
+        .sum()
+}
+
 fn draw_text_centered(
     image: &mut RgbaImage,
     font: &FontArc,
@@ -300,9 +360,29 @@ fn draw_text_centered(
     center_x: f32,
     center_y: f32,
 ) {
+    let width = text_width(font, scale, text);
+    draw_text_left(
+        image,
+        font,
+        text,
+        scale,
+        color,
+        center_x - width / 2.0,
+        center_y,
+    );
+}
+
+fn draw_text_left(
+    image: &mut RgbaImage,
+    font: &FontArc,
+    text: &str,
+    scale: PxScale,
+    color: Rgba<u8>,
+    left_x: f32,
+    center_y: f32,
+) {
     let scaled = font.as_scaled(scale);
     let mut min_x = f32::MAX;
-    let mut max_x = f32::MIN;
     let mut min_y = f32::MAX;
     let mut max_y = f32::MIN;
     let mut cx = 0.0f32;
@@ -313,7 +393,6 @@ fn draw_text_centered(
         if let Some(outline) = scaled.outline_glyph(glyph) {
             let bounds = outline.px_bounds();
             min_x = min_x.min(bounds.min.x);
-            max_x = max_x.max(bounds.max.x);
             min_y = min_y.min(bounds.min.y);
             max_y = max_y.max(bounds.max.y);
         }
@@ -324,9 +403,8 @@ fn draw_text_centered(
         return;
     }
 
-    let text_w = (max_x - min_x).max(1.0);
     let text_h = (max_y - min_y).max(1.0);
-    let offset_x = center_x - text_w / 2.0 - min_x;
+    let offset_x = left_x - min_x;
     let offset_y = center_y - text_h / 2.0 - min_y;
 
     let mut cx = offset_x;
@@ -378,7 +456,7 @@ fn draw_rect(image: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<
     }
 }
 
-fn format_duration_ms(ms: u64) -> String {
+pub(crate) fn format_duration_ms(ms: u64) -> String {
     let total_secs = ms / 1000;
     let mins = total_secs / 60;
     let secs = total_secs % 60;
@@ -617,5 +695,31 @@ mod tests {
         // the progress bar. Both must not panic.
         let frame = renderer.render_frame(0, 0, 0);
         assert_eq!(frame.width(), 16);
+    }
+
+    #[test]
+    fn sung_prefix_rounds_to_nearest_word_boundary() {
+        assert_eq!(sung_prefix("one two three", 0.0), "");
+        assert_eq!(sung_prefix("one two three", 0.5), "one two");
+        assert_eq!(sung_prefix("one two three", 1.0), "one two three");
+        // Out-of-range progress is clamped.
+        assert_eq!(sung_prefix("a b", -0.5), "");
+        assert_eq!(sung_prefix("a b", 1.5), "a b");
+    }
+
+    #[test]
+    fn sung_prefix_handles_single_word_and_whitespace_only() {
+        assert_eq!(sung_prefix("word", 0.0), "");
+        assert_eq!(sung_prefix("word", 0.6), "word");
+        assert_eq!(sung_prefix("", 0.5), "");
+        assert_eq!(sung_prefix("   ", 0.5), "   ");
+    }
+
+    #[test]
+    fn sung_prefix_stays_on_char_boundaries_with_unicode() {
+        // Multi-byte words must never be sliced mid-character.
+        let text = "cr\u{e9}me br\u{fb}l\u{e9} \u{65e5}\u{672c}";
+        assert_eq!(sung_prefix(text, 0.34), "cr\u{e9}me");
+        assert_eq!(sung_prefix(text, 1.0), text);
     }
 }

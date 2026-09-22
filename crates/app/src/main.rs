@@ -44,6 +44,8 @@ async fn run() -> Result<()> {
         },
         volume: cfg.volume,
         sample_rate: cfg.sample_rate,
+        default_lyrics: cfg.default_lyrics,
+        thread_replies: cfg.thread_replies,
     };
     let bot = Bot::new(
         bot_cfg,

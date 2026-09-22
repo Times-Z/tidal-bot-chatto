@@ -3,9 +3,9 @@ pub mod karaoke;
 pub mod queue;
 pub mod runtime;
 
-pub use commands::{Command, ParsedCommand, parse_command};
+pub use commands::{Command, ParsedCommand, command_help, parse_command};
 pub use karaoke::KaraokeRenderer;
-pub use queue::{Queue, Track};
+pub use queue::{Queue, RepeatMode, Track};
 pub use runtime::{Bot, BotConfig, Error};
 
 pub fn version() -> &'static str {
