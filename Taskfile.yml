@@ -13,8 +13,9 @@ tasks:
   ci:
     desc: Run continuous integration tasks
     cmds:
-      - "{{.TASK_BIN}} fmt"
-      - "{{.TASK_BIN}} test"
+      - task: fmt
+      - task: test
+      - task: build
 
   build:
     desc: Build chatto-bot-tidal binary (release)
