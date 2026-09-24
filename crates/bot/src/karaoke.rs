@@ -523,6 +523,48 @@ pub fn rgba_to_i420(rgba: &RgbaImage) -> Vec<u8> {
     i420
 }
 
+/// Fetch and blur the cover art for a karaoke background. Falls back to the
+/// gradient on any network or decode failure.
+pub(crate) async fn load_background(url: &str) -> image::RgbaImage {
+    let bytes = match reqwest::get(url).await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(b) => b,
+            Err(_) => return create_gradient_background(1920, 1080),
+        },
+        _ => return create_gradient_background(1920, 1080),
+    };
+
+    // Decoding + blurring are CPU-heavy: run off the async runtime so the
+    // voice loop stays responsive. Blur at 1/6 scale (radius scales with it)
+    // then upscale; visually identical for a background, far cheaper.
+    tokio::task::spawn_blocking(move || -> image::RgbaImage {
+        match image::load_from_memory(&bytes) {
+            Ok(img) => {
+                let small = img.resize_exact(320, 180, image::imageops::FilterType::Lanczos3);
+                let blurred = image::imageops::blur(&small.to_rgba8(), 4.0);
+                image::imageops::resize(&blurred, 1920, 1080, image::imageops::FilterType::Triangle)
+            }
+            Err(_) => create_gradient_background(1920, 1080),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| create_gradient_background(1920, 1080))
+}
+
+pub(crate) fn create_gradient_background(w: u32, h: u32) -> image::RgbaImage {
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        let t = y as f32 / h as f32;
+        let r = (26.0 * (1.0 - t) + 22.0 * t) as u8;
+        let g = (26.0 * (1.0 - t) + 33.0 * t) as u8;
+        let b = (46.0 * (1.0 - t) + 62.0 * t) as u8;
+        for x in 0..w {
+            img.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+    img
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +763,26 @@ mod tests {
         let text = "cr\u{e9}me br\u{fb}l\u{e9} \u{65e5}\u{672c}";
         assert_eq!(sung_prefix(text, 0.34), "cr\u{e9}me");
         assert_eq!(sung_prefix(text, 1.0), text);
+    }
+
+    #[test]
+    fn gradient_background_is_row_uniform_and_opaque() {
+        let img = create_gradient_background(8, 4);
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 4);
+
+        // Top row starts from the fixed base color.
+        assert_eq!(*img.get_pixel(0, 0), image::Rgba([26, 26, 46, 255]));
+        // Bottom row interpolates toward the end color.
+        assert_eq!(*img.get_pixel(7, 3), image::Rgba([23, 31, 58, 255]));
+
+        // Rows are uniform horizontally and fully opaque.
+        for y in 0..4 {
+            let first = *img.get_pixel(0, y);
+            for x in 0..8 {
+                assert_eq!(*img.get_pixel(x, y), first);
+                assert_eq!(first[3], 255);
+            }
+        }
     }
 }

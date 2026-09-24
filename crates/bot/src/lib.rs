@@ -3,6 +3,10 @@ pub mod karaoke;
 pub mod queue;
 pub mod runtime;
 
+mod card;
+mod handlers;
+mod voice;
+
 pub use commands::{Command, ParsedCommand, command_help, parse_command};
 pub use karaoke::KaraokeRenderer;
 pub use queue::{Queue, RepeatMode, Track};
