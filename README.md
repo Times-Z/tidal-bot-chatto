@@ -31,6 +31,8 @@ cargo build --release -p chatto-bot-tidal
 task build
 ```
 
+You can also find release here : https://github.com/Times-Z/tidal-bot-chatto/releases
+
 ## Development Tasks
 
 This project uses [Task](https://taskfile.dev) (task.dev) for common developer workflows.
